@@ -702,7 +702,7 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 		return nil, fmt.Errorf("tidak ada file yang diunggah")
 	}
 
-	headers := []string{"Nama Karyawan", "NIK", "Position", "Charge", "Date", "Day", "Day Category",
+	headers := []string{"Nama Karyawan", "NIK", "Position", "Charge", "Source", "Date", "Day", "Day Category",
 		"OT Morning Start", "OT Morning Finish", "OT Night Start", "OT Night Finish", "Total Overtime"}
 
 	result := &ProcessedResult{
@@ -751,6 +751,7 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 					pr.NIK,
 					pr.Position,
 					pr.Charge,
+					filename,
 					dateVal,
 					pr.Day,
 					pr.DayCategory,
@@ -854,11 +855,13 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 						dateVal = t.Format("2006-01-02")
 					}
 
+					sourceStr := fmt.Sprintf("%s (%s)", filename, sheetName)
 					outRow := []string{
 						empName,
 						nik,
 						position,
 						chargeTag,
+						sourceStr,
 						dateVal,
 						getCell(row, 1),
 						getCell(row, 2),
@@ -1139,7 +1142,7 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 	for _, dataRow := range res.Rows {
 		for colIdx, val := range dataRow {
 			cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
-			if colIdx == 4 { // Date column
+			if colIdx == 5 { // Date column
 				if t, ok := parseDateString(val); ok {
 					out.SetCellValue(outSheet, cell, t)
 				} else {
@@ -1153,7 +1156,7 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 		for colIdx := range res.Headers {
 			cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
 			var style int
-			if colIdx == 4 { // Date column
+			if colIdx == 5 { // Date column
 				style = oddDateStyle
 				if outRow%2 == 0 {
 					style = evenDateStyle
