@@ -2549,7 +2549,8 @@ function formatBytes(bytes) {
 }
 
 function escapeHtml(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  if (str === null || str === undefined) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function addFiles(files) {
@@ -2753,21 +2754,25 @@ async function loadUserTable() {
     tbody.innerHTML = '';
 
     data.users.forEach(u => {
+      const username = u.username || u.Username || '';
+      const createdAt = u.createdAt || u.CreatedAt || '-';
+      const isCurrent = u.isCurrent !== undefined ? u.isCurrent : u.IsCurrent;
+
       const tr = document.createElement('tr');
       
-      const badge = u.isCurrent 
+      const badge = isCurrent 
         ? '<span style="background:rgba(16,185,129,.15);color:#10b981;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:600">Aktif (Saya)</span>' 
         : '';
         
       tr.innerHTML = 
-        '<td><strong>' + escapeHtml(u.Username) + '</strong>' + badge + '</td>' +
-        '<td>' + escapeHtml(u.CreatedAt || '-') + '</td>' +
+        '<td><strong>' + escapeHtml(username) + '</strong>' + badge + '</td>' +
+        '<td>' + escapeHtml(createdAt) + '</td>' +
         '<td><span style="color:#10b981">● Active</span></td>' +
         '<td style="text-align:right;white-space:nowrap">' +
-          '<button class="btn btn-secondary btn-sm" onclick="openEditPwModal(\'' + escapeHtml(u.Username) + '\')" style="margin-right:6px">🔑 Ubah Password</button>' +
-          (u.isCurrent 
+          '<button class="btn btn-secondary btn-sm" onclick="openEditPwModal(\'' + escapeHtml(username) + '\')" style="margin-right:6px">🔑 Ubah Password</button>' +
+          (isCurrent 
             ? '<button class="btn btn-secondary btn-sm" disabled style="opacity:.4;cursor:not-allowed">🗑️ Hapus</button>' 
-            : '<button class="btn btn-sm" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)" onclick="openDeleteModal(\'' + escapeHtml(u.Username) + '\')">🗑️ Hapus</button>') +
+            : '<button class="btn btn-sm" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)" onclick="openDeleteModal(\'' + escapeHtml(username) + '\')">🗑️ Hapus</button>') +
         '</td>';
       tbody.appendChild(tr);
     });
