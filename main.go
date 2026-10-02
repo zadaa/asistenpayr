@@ -1,8 +1,10 @@
 package main
 
 import (
-	_ "embed"
+	"bytes"
 	"crypto/rand"
+	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -29,6 +31,16 @@ const (
 	authUsername = "lia"
 	authPassword = "422079"
 )
+
+// Default Claude API key provided by user
+const defaultClaudeAPIKey = "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"
+
+func getClaudeAPIKey() string {
+	if key := os.Getenv("CLAUDE_API_KEY"); key != "" {
+		return key
+	}
+	return defaultClaudeAPIKey
+}
 
 // Session store
 var (
@@ -92,6 +104,56 @@ type PreviewResponse struct {
 		Name  string `json:"name"`
 		Count int    `json:"count"`
 	} `json:"sheetStats,omitempty"`
+}
+
+// ExtractedRow is the structure returned by Claude API for PDF OCR
+type ExtractedRow struct {
+	EmpName         string `json:"emp_name"`
+	NIK             string `json:"nik"`
+	Position        string `json:"position"`
+	Charge          string `json:"charge"`
+	Date            string `json:"date"`
+	Day             string `json:"day"`
+	DayCategory     string `json:"day_category"`
+	OTMorningStart  string `json:"ot_morning_start"`
+	OTMorningFinish string `json:"ot_morning_finish"`
+	OTNightStart    string `json:"ot_night_start"`
+	OTNightFinish   string `json:"ot_night_finish"`
+	TotalOT         string `json:"total_ot"`
+}
+
+type ClaudeDocSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+type ClaudeContentItem struct {
+	Type   string           `json:"type"`
+	Text   string           `json:"text,omitempty"`
+	Source *ClaudeDocSource `json:"source,omitempty"`
+}
+
+type ClaudeMessage struct {
+	Role    string              `json:"role"`
+	Content []ClaudeContentItem `json:"content"`
+}
+
+type ClaudeReq struct {
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	Messages  []ClaudeMessage `json:"messages"`
+}
+
+type ClaudeResp struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 func main() {
@@ -275,14 +337,157 @@ func handleLogo(w http.ResponseWriter, r *http.Request) {
 	w.Write(logoBytes)
 }
 
-func parseUploadedExcels(r *http.Request) ([]*excelize.File, []string, []string, error) {
+func parsePDFWithClaude(pdfBytes []byte) ([]ExtractedRow, error) {
+	apiKey := getClaudeAPIKey()
+	base64PDF := base64.StdEncoding.EncodeToString(pdfBytes)
+
+	prompt := `Anda adalah AI extractor data lembur / SPL (Surat Perintah Lembur). 
+Silakan baca dokumen PDF ini (yang mungkin berupa tulisan tangan atau formulir cetakan) dan ekstrak SEMUA entri data lembur ke dalam JSON array murni.
+
+Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
+- "emp_name": Nama Karyawan
+- "nik": NIK / Nomor Induk Karyawan (jika ada, jika tidak ada isi "")
+- "position": Jabatan / Posisi (jika ada, jika tidak ada isi "")
+- "charge": Tag Charge / Customer / Divisi / Cost Center (jika ada, contoh: Chg Persol, Chg Coke, dll)
+- "date": Tanggal lembur (format YYYY-MM-DD atau sesuai tertera)
+- "day": Nama Hari (contoh: Senin, Selasa, Sab, Jum, dll)
+- "day_category": Kategori Hari (contoh: WD untuk Workday, HO untuk Holiday/Off, AL untuk Annual Leave)
+- "ot_morning_start": Jam Mulai Lembur Pagi (contoh: 06:00, jika tidak ada isi "")
+- "ot_morning_finish": Jam Selesai Lembur Pagi (contoh: 08:00, jika tidak ada isi "")
+- "ot_night_start": Jam Mulai Lembur Malam (contoh: 17:00, jika tidak ada isi "")
+- "ot_night_finish": Jam Selesai Lembur Malam (contoh: 21:00, jika tidak ada isi "")
+- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4, jika tidak ada isi "")
+
+PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILARANG menyertakan teks pembuka, penutup, atau formatting markdown.`
+
+	models := []string{
+		"claude-3-5-sonnet-20241022",
+		"claude-3-7-sonnet-20250219",
+		"claude-3-5-haiku-20241022",
+		"claude-3-haiku-20240307",
+	}
+
+	var lastErr error
+	for _, model := range models {
+		reqBody := ClaudeReq{
+			Model:     model,
+			MaxTokens: 4096,
+			Messages: []ClaudeMessage{
+				{
+					Role: "user",
+					Content: []ClaudeContentItem{
+						{
+							Type: "document",
+							Source: &ClaudeDocSource{
+								Type:      "base64",
+								MediaType: "application/pdf",
+								Data:      base64PDF,
+							},
+						},
+						{
+							Type: "text",
+							Text: prompt,
+						},
+					},
+				},
+			},
+		}
+
+		jsonBytes, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(jsonBytes))
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
+
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			var cErr ClaudeResp
+			_ = json.Unmarshal(respBytes, &cErr)
+			if cErr.Error != nil {
+				lastErr = fmt.Errorf("Claude API error (%s): %s", model, cErr.Error.Message)
+			} else {
+				lastErr = fmt.Errorf("Claude API HTTP %d: %s", resp.StatusCode, string(respBytes))
+			}
+			continue
+		}
+
+		var cResp ClaudeResp
+		if err := json.Unmarshal(respBytes, &cResp); err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(cResp.Content) == 0 {
+			lastErr = fmt.Errorf("Claude API returning empty content")
+			continue
+		}
+
+		rawText := ""
+		for _, cnt := range cResp.Content {
+			if cnt.Type == "text" {
+				rawText += cnt.Text
+			}
+		}
+
+		// Clean JSON response
+		rawText = strings.TrimSpace(rawText)
+		if idx := strings.Index(rawText, "["); idx != -1 {
+			if lastIdx := strings.LastIndex(rawText, "]"); lastIdx != -1 && lastIdx > idx {
+				rawText = rawText[idx : lastIdx+1]
+			}
+		}
+
+		var rows []ExtractedRow
+		if err := json.Unmarshal([]byte(rawText), &rows); err != nil {
+			lastErr = fmt.Errorf("Gagal parsing JSON output dari AI (%s): %v", model, err)
+			continue
+		}
+
+		return rows, nil
+	}
+
+	return nil, fmt.Errorf("Gagal memproses PDF dengan AI: %v", lastErr)
+}
+
+type ProcessedResult struct {
+	TotalFiles int
+	Headers    []string
+	Rows       [][]string
+	SheetStats []struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+	SheetNames []string
+}
+
+func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 	err := r.ParseMultipartForm(100 << 20) // 100MB max
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("gagal membaca form: %v", err)
+		return nil, fmt.Errorf("gagal membaca form: %v", err)
 	}
 
 	var fileHeaders []*multipart.FileHeader
-
 	if fhs, ok := r.MultipartForm.File["file"]; ok && len(fhs) > 0 {
 		fileHeaders = append(fileHeaders, fhs...)
 	}
@@ -291,50 +496,194 @@ func parseUploadedExcels(r *http.Request) ([]*excelize.File, []string, []string,
 	}
 
 	if len(fileHeaders) == 0 {
-		return nil, nil, nil, fmt.Errorf("tidak ada file yang diunggah")
+		return nil, fmt.Errorf("tidak ada file yang diunggah")
 	}
 
-	var excelFiles []*excelize.File
-	var tmpPaths []string
-	var filenames []string
+	headers := []string{"Nama Karyawan", "NIK", "Position", "Charge", "Date", "Day", "Day Category",
+		"OT Morning Start", "OT Morning Finish", "OT Night Start", "OT Night Finish", "Total Overtime"}
+
+	result := &ProcessedResult{
+		TotalFiles: len(fileHeaders),
+		Headers:    headers,
+	}
 
 	for _, handler := range fileHeaders {
+		filename := handler.Filename
+		lowerName := strings.ToLower(filename)
+
 		file, err := handler.Open()
 		if err != nil {
 			continue
 		}
 
-		tmpFile, err := os.CreateTemp("", "merge-lembur-*.xlsx")
-		if err != nil {
-			file.Close()
-			continue
-		}
-		tmpPath := tmpFile.Name()
-
-		_, err = io.Copy(tmpFile, file)
+		fileBytes, err := io.ReadAll(file)
 		file.Close()
-		tmpFile.Close()
 		if err != nil {
-			os.Remove(tmpPath)
 			continue
 		}
 
-		f, err := excelize.OpenFile(tmpPath)
-		if err != nil {
+		if strings.HasSuffix(lowerName, ".pdf") {
+			// Process PDF with Claude Vision AI
+			pdfRows, err := parsePDFWithClaude(fileBytes)
+			if err != nil {
+				return nil, fmt.Errorf("gagal membaca PDF '%s': %v", filename, err)
+			}
+
+			dataCount := 0
+			empNameMap := make(map[string]int)
+
+			for _, pr := range pdfRows {
+				emp := strings.TrimSpace(pr.EmpName)
+				if emp == "" {
+					emp = strings.TrimSuffix(filename, ".pdf")
+				}
+
+				dateVal := pr.Date
+				if t, ok := parseDateString(dateVal); ok {
+					dateVal = t.Format("2006-01-02")
+				}
+
+				outRow := []string{
+					emp,
+					pr.NIK,
+					pr.Position,
+					pr.Charge,
+					dateVal,
+					pr.Day,
+					pr.DayCategory,
+					pr.OTMorningStart,
+					pr.OTMorningFinish,
+					pr.OTNightStart,
+					pr.OTNightFinish,
+					pr.TotalOT,
+				}
+				result.Rows = append(result.Rows, outRow)
+				dataCount++
+				empNameMap[emp]++
+			}
+
+			for emp, cnt := range empNameMap {
+				sheetLabel := fmt.Sprintf("%s (PDF)", emp)
+				result.SheetNames = append(result.SheetNames, sheetLabel)
+				result.SheetStats = append(result.SheetStats, struct {
+					Name  string `json:"name"`
+					Count int    `json:"count"`
+				}{Name: sheetLabel, Count: cnt})
+			}
+			if len(empNameMap) == 0 {
+				sheetLabel := fmt.Sprintf("%s (PDF)", filename)
+				result.SheetNames = append(result.SheetNames, sheetLabel)
+				result.SheetStats = append(result.SheetStats, struct {
+					Name  string `json:"name"`
+					Count int    `json:"count"`
+				}{Name: sheetLabel, Count: 0})
+			}
+
+		} else if strings.HasSuffix(lowerName, ".xlsx") || strings.HasSuffix(lowerName, ".xls") {
+			// Save to temp file for excelize
+			tmpFile, err := os.CreateTemp("", "merge-lembur-*.xlsx")
+			if err != nil {
+				continue
+			}
+			tmpPath := tmpFile.Name()
+			tmpFile.Write(fileBytes)
+			tmpFile.Close()
+
+			f, err := excelize.OpenFile(tmpPath)
+			if err != nil {
+				os.Remove(tmpPath)
+				continue
+			}
+
+			sheets := f.GetSheetList()
+			for _, sheetName := range sheets {
+				result.SheetNames = append(result.SheetNames, sheetName)
+				rows, err := f.GetRows(sheetName)
+				if err != nil || len(rows) < 19 {
+					result.SheetStats = append(result.SheetStats, struct {
+						Name  string `json:"name"`
+						Count int    `json:"count"`
+					}{Name: sheetName, Count: 0})
+					continue
+				}
+
+				empName := extractEmployeeName(rows)
+				if empName == "" {
+					empName = sheetName
+				}
+				nik := getCell(rows[2], 1)
+				position := ""
+				for i := 4; i < 8 && i < len(rows); i++ {
+					if len(rows[i]) >= 3 && strings.EqualFold(strings.TrimSpace(rows[i][1]), "Position") {
+						position = strings.TrimSpace(rows[i][2])
+						break
+					}
+				}
+				chargeTag := extractChargeTag(sheetName)
+
+				headerRowIdx := findHeaderRow(rows)
+				if headerRowIdx < 0 {
+					result.SheetStats = append(result.SheetStats, struct {
+						Name  string `json:"name"`
+						Count int    `json:"count"`
+					}{Name: sheetName, Count: 0})
+					continue
+				}
+
+				dataStartIdx := findDataStartRow(rows, headerRowIdx)
+				if dataStartIdx < 0 {
+					result.SheetStats = append(result.SheetStats, struct {
+						Name  string `json:"name"`
+						Count int    `json:"count"`
+					}{Name: sheetName, Count: 0})
+					continue
+				}
+
+				dataCount := 0
+				for i := dataStartIdx; i < len(rows); i++ {
+					row := rows[i]
+					if isEmptyDataRow(row) {
+						continue
+					}
+
+					dateVal := getCell(row, 0)
+					if t, ok := parseDateString(dateVal); ok {
+						dateVal = t.Format("2006-01-02")
+					}
+
+					outRow := []string{
+						empName,
+						nik,
+						position,
+						chargeTag,
+						dateVal,
+						getCell(row, 1),
+						getCell(row, 2),
+						getCell(row, 3),
+						getCell(row, 4),
+						getCell(row, 5),
+						getCell(row, 6),
+						getCell(row, 7),
+					}
+					result.Rows = append(result.Rows, outRow)
+					dataCount++
+				}
+				result.SheetStats = append(result.SheetStats, struct {
+					Name  string `json:"name"`
+					Count int    `json:"count"`
+				}{Name: empName, Count: dataCount})
+			}
+
+			f.Close()
 			os.Remove(tmpPath)
-			continue
 		}
-
-		excelFiles = append(excelFiles, f)
-		tmpPaths = append(tmpPaths, tmpPath)
-		filenames = append(filenames, handler.Filename)
 	}
 
-	if len(excelFiles) == 0 {
-		return nil, nil, nil, fmt.Errorf("gagal membaca file Excel yang diunggah")
+	if len(result.Rows) == 0 && len(result.SheetStats) == 0 {
+		return nil, fmt.Errorf("tidak dapat menemukan data lembur dalam file yang diunggah")
 	}
 
-	return excelFiles, tmpPaths, filenames, nil
+	return result, nil
 }
 
 // getCell safely gets a cell value from a row slice
@@ -346,8 +695,6 @@ func getCell(row []string, idx int) string {
 }
 
 // extractEmployeeName extracts the employee name from the sheet metadata.
-// It looks at rows 3-7 for a row containing "Name" in column B (index 1)
-// and the actual name in column C (index 2).
 func extractEmployeeName(rows [][]string) string {
 	for i := 2; i < 8 && i < len(rows); i++ {
 		if len(rows[i]) >= 3 {
@@ -361,7 +708,6 @@ func extractEmployeeName(rows [][]string) string {
 }
 
 // extractChargeTag extracts the charge category/tag (e.g. "Chg Coke", "Chg Persol") from sheet name.
-// Sheet names are often formatted like "Employee_Chg Persol" or "_Chg Coke".
 func extractChargeTag(sheetName string) string {
 	idx := strings.LastIndex(sheetName, "_")
 	if idx != -1 {
@@ -373,7 +719,7 @@ func extractChargeTag(sheetName string) string {
 	return ""
 }
 
-// parseDateString converts date strings (e.g. "13-Aug-26", "26/07/2026", "13-Agustus-2026") into time.Time.
+// parseDateString converts date strings into time.Time.
 func parseDateString(s string) (time.Time, bool) {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\u00a0", " ")
@@ -382,14 +728,12 @@ func parseDateString(s string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	// Check if it's an Excel numeric serial date (e.g. "46229" or "46229.0")
 	if num, err := strconv.ParseFloat(s, 64); err == nil && num > 30000 && num < 100000 {
 		if t, err := excelize.ExcelDateToTime(num, false); err == nil {
 			return t, true
 		}
 	}
 
-	// Replacer for Indonesian month names to English
 	r := strings.NewReplacer(
 		"Januari", "Jan", "Februari", "Feb", "Maret", "Mar",
 		"April", "Apr", "Mei", "May", "Juni", "Jun", "Juli", "Jul",
@@ -402,7 +746,6 @@ func parseDateString(s string) (time.Time, bool) {
 	normalized := r.Replace(s)
 
 	formats := []string{
-		// Day-MonthName-Year (single & double digit day)
 		"2-Jan-06",
 		"02-Jan-06",
 		"2-Jan-2006",
@@ -412,7 +755,6 @@ func parseDateString(s string) (time.Time, bool) {
 		"2 Jan 06",
 		"02 Jan 06",
 
-		// DD/MM/YYYY and DD-MM-YYYY (single & double digit day/month)
 		"2/1/2006",
 		"02/01/2006",
 		"2/1/06",
@@ -422,13 +764,11 @@ func parseDateString(s string) (time.Time, bool) {
 		"2-1-06",
 		"02-01-06",
 
-		// MM/DD/YYYY fallback
 		"1/2/2006",
 		"01/02/2006",
 		"1/2/06",
 		"01/02/06",
 
-		// YYYY-MM-DD and YYYY/MM/DD
 		"2006-1-2",
 		"2006-01-02",
 		"2006/1/2",
@@ -443,8 +783,6 @@ func parseDateString(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// findHeaderRow finds the row index containing the data table header.
-// It looks for a row containing "Date" in the first non-empty cell.
 func findHeaderRow(rows [][]string) int {
 	for i := 10; i < len(rows) && i < 25; i++ {
 		for _, cell := range rows[i] {
@@ -457,13 +795,10 @@ func findHeaderRow(rows [][]string) int {
 	return -1
 }
 
-// findDataStartRow finds the first actual data row after headers/sub-headers.
-// Data rows have a non-empty date in column A (index 0).
 func findDataStartRow(rows [][]string, headerRowIdx int) int {
 	for i := headerRowIdx + 1; i < len(rows); i++ {
 		if len(rows[i]) > 0 {
 			first := strings.TrimSpace(rows[i][0])
-			// Skip sub-header rows (empty first cell or "Start"/"Finish" labels)
 			if first != "" && !strings.EqualFold(first, "Start") && !strings.EqualFold(first, "Finish") {
 				return i
 			}
@@ -472,13 +807,10 @@ func findDataStartRow(rows [][]string, headerRowIdx int) int {
 	return -1
 }
 
-// isEmptyDataRow checks if a data row has no real overtime data
-// (only contains 0:00 in total or all empty meaningful cells)
 func isEmptyDataRow(row []string) bool {
 	if len(row) == 0 {
 		return true
 	}
-	// If the first cell (Date) is empty, it's a filler row
 	if strings.TrimSpace(row[0]) == "" {
 		return true
 	}
@@ -493,139 +825,27 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	excelFiles, tmpPaths, filenames, err := parseUploadedExcels(r)
+	res, err := processUploadedFiles(r)
 	if err != nil {
 		json.NewEncoder(w).Encode(PreviewResponse{Error: err.Error()})
 		return
 	}
-	defer func() {
-		for _, f := range excelFiles {
-			f.Close()
-		}
-		for _, path := range tmpPaths {
-			os.Remove(path)
-		}
-	}()
 
 	resp := PreviewResponse{
 		Success:    true,
-		TotalFiles: len(excelFiles),
+		TotalFiles: res.TotalFiles,
+		Sheets:     res.SheetNames,
+		Headers:    res.Headers,
+		TotalRows:  len(res.Rows),
+		SheetStats: res.SheetStats,
 	}
 
-	type sheetStat struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	}
-
-	// Output headers
-	headers := []string{"Nama Karyawan", "NIK", "Position", "Charge", "Date", "Day", "Day Category",
-		"OT Morning Start", "OT Morning Finish", "OT Night Start", "OT Night Finish", "Total Overtime"}
-
-	var allRows [][]string
-	var stats []sheetStat
-	var allSheetNames []string
-
-	for fIdx, f := range excelFiles {
-		_ = filenames[fIdx]
-		sheets := f.GetSheetList()
-		for _, sheetName := range sheets {
-			allSheetNames = append(allSheetNames, sheetName)
-			rows, err := f.GetRows(sheetName)
-			if err != nil || len(rows) < 19 {
-				stats = append(stats, sheetStat{Name: sheetName, Count: 0})
-				continue
-			}
-
-			// Extract employee metadata
-			empName := extractEmployeeName(rows)
-			if empName == "" {
-				empName = sheetName // fallback to sheet name
-			}
-
-			// Extract NIK from row 3 (index 2)
-			nik := getCell(rows[2], 1)
-
-			// Extract Position from row 6 (index 5)
-			position := ""
-			for i := 4; i < 8 && i < len(rows); i++ {
-				if len(rows[i]) >= 3 && strings.EqualFold(strings.TrimSpace(rows[i][1]), "Position") {
-					position = strings.TrimSpace(rows[i][2])
-					break
-				}
-			}
-
-			// Extract charge tag from sheet name
-			chargeTag := extractChargeTag(sheetName)
-
-			// Find data start
-			headerRowIdx := findHeaderRow(rows)
-			if headerRowIdx < 0 {
-				stats = append(stats, sheetStat{Name: sheetName, Count: 0})
-				continue
-			}
-
-			dataStartIdx := findDataStartRow(rows, headerRowIdx)
-			if dataStartIdx < 0 {
-				stats = append(stats, sheetStat{Name: sheetName, Count: 0})
-				continue
-			}
-
-			dataCount := 0
-			for i := dataStartIdx; i < len(rows); i++ {
-				row := rows[i]
-				if isEmptyDataRow(row) {
-					continue
-				}
-
-				dateVal := getCell(row, 0)
-				if t, ok := parseDateString(dateVal); ok {
-					dateVal = t.Format("2006-01-02")
-				}
-
-				// Build output row
-				outRow := []string{
-					empName,
-					nik,
-					position,
-					chargeTag,
-					dateVal,         // Date
-					getCell(row, 1), // Day
-					getCell(row, 2), // Day Category
-					getCell(row, 3), // OT Morning Start
-					getCell(row, 4), // OT Morning Finish
-					getCell(row, 5), // OT Night Start
-					getCell(row, 6), // OT Night Finish
-					getCell(row, 7), // Total Overtime
-				}
-				allRows = append(allRows, outRow)
-				dataCount++
-			}
-			stats = append(stats, sheetStat{Name: empName, Count: dataCount})
-		}
-	}
-
-	resp.Sheets = allSheetNames
-	resp.Headers = headers
-	resp.TotalRows = len(allRows)
-
-	// Return up to 200 rows for preview
 	previewLimit := 200
-	if len(allRows) <= previewLimit {
-		resp.Rows = allRows
+	if len(res.Rows) <= previewLimit {
+		resp.Rows = res.Rows
 	} else {
-		resp.Rows = allRows[:previewLimit]
+		resp.Rows = res.Rows[:previewLimit]
 	}
-
-	// Marshal stats
-	statsJSON := make([]struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	}, len(stats))
-	for i, s := range stats {
-		statsJSON[i].Name = s.Name
-		statsJSON[i].Count = s.Count
-	}
-	resp.SheetStats = statsJSON
 
 	json.NewEncoder(w).Encode(resp)
 }
@@ -636,21 +856,12 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	excelFiles, tmpPaths, _, err := parseUploadedExcels(r)
+	res, err := processUploadedFiles(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	defer func() {
-		for _, f := range excelFiles {
-			f.Close()
-		}
-		for _, path := range tmpPaths {
-			os.Remove(path)
-		}
-	}()
 
-	// Create output file
 	out := excelize.NewFile()
 	outSheet := "Data Lembur Gabungan"
 	idx, _ := out.NewSheet(outSheet)
@@ -713,110 +924,50 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	headers := []string{"Nama Karyawan", "NIK", "Position", "Charge", "Date", "Day", "Day Category",
-		"OT Morning Start", "OT Morning Finish", "OT Night Start", "OT Night Finish", "Total Overtime"}
-
 	// Write headers
 	outRow := 1
-	for colIdx, h := range headers {
+	for colIdx, h := range res.Headers {
 		cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
 		out.SetCellValue(outSheet, cell, h)
 		out.SetCellStyle(outSheet, cell, cell, headerStyle)
 	}
 	outRow++
 
-	for _, f := range excelFiles {
-		sheets := f.GetSheetList()
-		for _, sheetName := range sheets {
-			rows, err := f.GetRows(sheetName)
-			if err != nil || len(rows) < 19 {
-				continue
-			}
-
-			// Extract employee metadata
-			empName := extractEmployeeName(rows)
-			if empName == "" {
-				empName = sheetName
-			}
-
-			nik := getCell(rows[2], 1)
-
-			position := ""
-			for i := 4; i < 8 && i < len(rows); i++ {
-				if len(rows[i]) >= 3 && strings.EqualFold(strings.TrimSpace(rows[i][1]), "Position") {
-					position = strings.TrimSpace(rows[i][2])
-					break
+	for _, dataRow := range res.Rows {
+		for colIdx, val := range dataRow {
+			cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
+			if colIdx == 4 { // Date column
+				if t, ok := parseDateString(val); ok {
+					out.SetCellValue(outSheet, cell, t)
+				} else {
+					out.SetCellValue(outSheet, cell, val)
 				}
-			}
-
-			chargeTag := extractChargeTag(sheetName)
-
-			headerRowIdx := findHeaderRow(rows)
-			if headerRowIdx < 0 {
-				continue
-			}
-			dataStartIdx := findDataStartRow(rows, headerRowIdx)
-			if dataStartIdx < 0 {
-				continue
-			}
-
-			for i := dataStartIdx; i < len(rows); i++ {
-				row := rows[i]
-				if isEmptyDataRow(row) {
-					continue
-				}
-
-				dataRow := []string{
-					empName,
-					nik,
-					position,
-					chargeTag,
-					getCell(row, 0),
-					getCell(row, 1),
-					getCell(row, 2),
-					getCell(row, 3),
-					getCell(row, 4),
-					getCell(row, 5),
-					getCell(row, 6),
-					getCell(row, 7),
-				}
-
-				for colIdx, val := range dataRow {
-					cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
-					if colIdx == 4 { // Date column
-						if t, ok := parseDateString(val); ok {
-							out.SetCellValue(outSheet, cell, t)
-						} else {
-							out.SetCellValue(outSheet, cell, val)
-						}
-					} else {
-						out.SetCellValue(outSheet, cell, val)
-					}
-				}
-
-				for colIdx := range headers {
-					cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
-					var style int
-					if colIdx == 4 { // Date column
-						style = oddDateStyle
-						if outRow%2 == 0 {
-							style = evenDateStyle
-						}
-					} else {
-						style = oddRowStyle
-						if outRow%2 == 0 {
-							style = evenRowStyle
-						}
-					}
-					out.SetCellStyle(outSheet, cell, cell, style)
-				}
-				outRow++
+			} else {
+				out.SetCellValue(outSheet, cell, val)
 			}
 		}
+
+		for colIdx := range res.Headers {
+			cell, _ := excelize.CoordinatesToCellName(colIdx+1, outRow)
+			var style int
+			if colIdx == 4 { // Date column
+				style = oddDateStyle
+				if outRow%2 == 0 {
+					style = evenDateStyle
+				}
+			} else {
+				style = oddRowStyle
+				if outRow%2 == 0 {
+					style = evenRowStyle
+				}
+			}
+			out.SetCellStyle(outSheet, cell, cell, style)
+		}
+		outRow++
 	}
 
 	// Auto-fit columns
-	for colIdx, h := range headers {
+	for colIdx, h := range res.Headers {
 		maxLen := len(h)
 		for r := 2; r <= outRow; r++ {
 			cell, _ := excelize.CoordinatesToCellName(colIdx+1, r)
@@ -843,13 +994,12 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Auto filter
-	if len(headers) > 0 {
-		lastColName, _ := excelize.ColumnNumberToName(len(headers))
+	if len(res.Headers) > 0 {
+		lastColName, _ := excelize.ColumnNumberToName(len(res.Headers))
 		lastCell := fmt.Sprintf("%s%d", lastColName, outRow-1)
 		out.AutoFilter(outSheet, fmt.Sprintf("A1:%s", lastCell), nil)
 	}
 
-	// Write to temp file and serve
 	tmpOut, err := os.CreateTemp("", "merged-*.xlsx")
 	if err != nil {
 		http.Error(w, "Gagal membuat file output", 500)
@@ -1172,7 +1322,6 @@ form.addEventListener('submit', async (e) => {
       loginBtn.innerHTML = 'Masuk';
     }
   } catch (err) {
-    // If fetch fails due to browser restrictions / proxy / network, fallback to native form submit
     console.warn('Fetch failed, falling back to standard form submission', err);
     form.submit();
   }
@@ -1192,7 +1341,7 @@ const indexHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Asisten Payrol — Penggabung Data Lembur</title>
+<title>Asisten Payrol — Penggabung Data Lembur Excel & PDF</title>
 <link rel="icon" type="image/png" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1563,7 +1712,7 @@ input[type=file]{display:none}
       <div class="logo-icon"><img src="/logo.png" alt="Asisten Payroll Logo"></div>
       <span class="logo-text">Asisten Payrol</span>
     </div>
-    <p>Upload file Excel lembur karyawan (multi-sheet),<br>gabungkan jadi satu tabel rapi dalam sekali klik.</p>
+    <p>Upload file Excel &amp; PDF lembur karyawan (termasuk formulir tulisan tangan),<br>gabungkan semua data jadi satu tabel rapi secara otomatis dengan Claude AI.</p>
   </header>
 
   <div style="position:fixed;top:20px;right:24px;z-index:50">
@@ -1587,12 +1736,12 @@ input[type=file]{display:none}
   <div class="card">
     <div class="drop-zone" id="dropZone">
       <div class="drop-icon">📁</div>
-      <div class="drop-title">Drag & drop file Excel di sini</div>
-      <div class="drop-subtitle">atau klik tombol di bawah untuk memilih file (.xlsx) &bull; bisa pilih beberapa file sekaligus</div>
+      <div class="drop-title">Drag &amp; drop file Excel (.xlsx) atau PDF di sini</div>
+      <div class="drop-subtitle">atau klik tombol di bawah untuk memilih file (.xlsx, .pdf) &bull; dukung baca formulir PDF tulisan tangan dengan AI</div>
       <button class="drop-btn" id="browseBtn">
-        <span>📎</span> Pilih File (Bisa Multiple)
+        <span>📎</span> Pilih File Excel / PDF (Multiple)
       </button>
-      <input type="file" id="fileInput" accept=".xlsx,.xls" multiple>
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.pdf" multiple>
 
       <div class="file-list" id="fileList"></div>
     </div>
@@ -1624,7 +1773,7 @@ input[type=file]{display:none}
   <div class="sheet-list" id="sheetList"></div>
 
   <div class="preview-label" id="previewLabel">
-    <span>👁️</span> Preview data gabungan
+    <span>👁️</span> Preview data gabungan (Excel + PDF)
   </div>
   <div class="table-wrapper" id="tableWrapper">
     <table class="preview-table" id="previewTable">
@@ -1635,7 +1784,7 @@ input[type=file]{display:none}
 
   <div class="spinner" id="spinner">
     <div class="spinner-ring"></div>
-    <div class="spinner-text">Memproses file Excel...</div>
+    <div class="spinner-text" id="spinnerText">Memproses file Excel &amp; PDF dengan AI...</div>
   </div>
 
   <div class="actions" id="actions">
@@ -1649,7 +1798,7 @@ input[type=file]{display:none}
 </div>
 
 <div class="footer">
-  <p>Asisten Payrol &mdash; dibuat dengan ❤️ menggunakan Go + Excelize</p>
+  <p>Asisten Payrol &mdash; dibuat dengan ❤️ menggunakan Go + Excelize + Claude AI</p>
 </div>
 
 <div class="toast" id="toast">
@@ -1684,9 +1833,9 @@ let selectedFiles = [];
   dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); });
 });
 dropZone.addEventListener('drop', e => {
-  const files = Array.from(e.dataTransfer.files).filter(f => f.name.match(/\.xlsx?$/i));
+  const files = Array.from(e.dataTransfer.files).filter(f => f.name.match(/\.(xlsx?|pdf)$/i));
   if (files.length > 0) addFiles(files);
-  else showToast('❌', 'Hanya file .xlsx yang didukung', 'error');
+  else showToast('❌', 'Hanya file .xlsx dan .pdf yang didukung', 'error');
 });
 
 browseBtn.addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
@@ -1714,7 +1863,7 @@ function escapeHtml(str) {
 
 function addFiles(files) {
   files.forEach(f => {
-    if (!f.name.match(/\.xlsx?$/i)) return;
+    if (!f.name.match(/\.(xlsx?|pdf)$/i)) return;
     if (!selectedFiles.some(sf => sf.name === f.name && sf.size === f.size)) {
       selectedFiles.push(f);
     }
@@ -1746,9 +1895,11 @@ function renderFileList() {
   selectedFiles.forEach((file, idx) => {
     const item = document.createElement('div');
     item.className = 'file-item';
-    item.innerHTML = '<span class="file-item-icon">📄</span>' +
+    const isPDF = file.name.match(/\.pdf$/i);
+    const icon = isPDF ? '📄' : '📊';
+    item.innerHTML = '<span class="file-item-icon">' + icon + '</span>' +
       '<div class="file-item-details">' +
-        '<div class="file-item-name">' + escapeHtml(file.name) + '</div>' +
+        '<div class="file-item-name">' + escapeHtml(file.name) + (isPDF ? ' <span style="font-size:10px;background:#ec4899;color:#fff;padding:1px 6px;border-radius:6px;margin-left:4px">PDF AI</span>' : '') + '</div>' +
         '<div class="file-item-size">' + formatBytes(file.size) + '</div>' +
       '</div>' +
       '<button class="file-item-remove" title="Hapus file" onclick="event.stopPropagation(); removeFile(' + idx + ')">✕</button>';
@@ -1759,6 +1910,10 @@ function renderFileList() {
 
 async function previewFiles() {
   if (selectedFiles.length === 0) return;
+  
+  const hasPDF = selectedFiles.some(f => f.name.match(/\.pdf$/i));
+  $('spinnerText').textContent = hasPDF ? 'Membaca formulir PDF dengan Claude AI & Excel...' : 'Memproses file Excel...';
+  
   spinner.classList.add('visible');
   actions.classList.remove('visible');
   statsBar.classList.remove('visible');
@@ -1794,7 +1949,9 @@ async function previewFiles() {
         const pill = document.createElement('span');
         pill.className = 'sheet-pill';
         pill.style.animationDelay = (i * 40) + 'ms';
-        pill.innerHTML = '👤 ' + escapeHtml(s.name) + ' <span class="pill-count">' + s.count + '</span>';
+        const isPDFSheet = s.name.includes('(PDF)');
+        const icon = isPDFSheet ? '📄' : '👤';
+        pill.innerHTML = icon + ' ' + escapeHtml(s.name) + ' <span class="pill-count">' + s.count + '</span>';
         sheetList.appendChild(pill);
       });
       sheetList.classList.add('visible');
