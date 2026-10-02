@@ -32,14 +32,22 @@ const (
 	authPassword = "422079"
 )
 
-// Default Claude API key provided by user
-const defaultClaudeAPIKey = "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"
-
 func getClaudeAPIKey() string {
 	if key := os.Getenv("CLAUDE_API_KEY"); key != "" {
-		return key
+		return strings.TrimSpace(key)
 	}
-	return defaultClaudeAPIKey
+	if b, err := os.ReadFile(".env"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "CLAUDE_API_KEY=") {
+				return strings.TrimSpace(strings.TrimPrefix(line, "CLAUDE_API_KEY="))
+			}
+		}
+	}
+	if b, err := os.ReadFile("claude_key.txt"); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
 }
 
 // Session store
