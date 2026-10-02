@@ -661,11 +661,11 @@ func parsePDFWithAI(pdfBytes []byte) ([]ExtractedRow, error) {
 
 	claudeKey := getClaudeAPIKey()
 	if claudeKey != "" {
-		if strings.HasPrefix(claudeKey, "sk-ant-api03-") {
+		if strings.HasPrefix(claudeKey, "sk-ant-api03-") || strings.HasPrefix(claudeKey, "sk-ant-svc-") {
 			return parsePDFWithClaude(pdfBytes, claudeKey)
 		}
 		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
-			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai, bukan API Developer Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (diawali 'sk-ant-api03-') atau atur GEMINI_API_KEY gratis dari https://aistudio.google.com/app/apikey")
+			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai, bukan API Developer Console. Mohon gunakan API Key resmi dari Service Account https://console.anthropic.com (diawali 'sk-ant-svc-' atau 'sk-ant-api03-') atau atur GEMINI_API_KEY gratis dari https://aistudio.google.com/app/apikey")
 		}
 		return parsePDFWithClaude(pdfBytes, claudeKey)
 	}
