@@ -51,6 +51,24 @@ func getClaudeAPIKey() string {
 	return ""
 }
 
+func getGeminiAPIKey() string {
+	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
+		return strings.TrimSpace(key)
+	}
+	if b, err := os.ReadFile(".env"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "GEMINI_API_KEY=") {
+				return strings.TrimSpace(strings.TrimPrefix(line, "GEMINI_API_KEY="))
+			}
+		}
+	}
+	if b, err := os.ReadFile("gemini_key.txt"); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
 func generateToken() string {
 	exp := time.Now().Add(7 * 24 * time.Hour).Unix()
 	payload := fmt.Sprintf("%s|%d", authUsername, exp)
@@ -175,6 +193,42 @@ type ClaudeResp struct {
 	} `json:"content"`
 	Error *struct {
 		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type GeminiPart struct {
+	Text       string            `json:"text,omitempty"`
+	InlineData *GeminiInlineData `json:"inline_data,omitempty"`
+}
+
+type GeminiInlineData struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"`
+}
+
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiGenConfig struct {
+	ResponseMimeType string `json:"response_mime_type,omitempty"`
+}
+
+type GeminiReq struct {
+	Contents         []GeminiContent  `json:"contents"`
+	GenerationConfig *GeminiGenConfig `json:"generationConfig,omitempty"`
+}
+
+type GeminiResp struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
 }
@@ -346,8 +400,10 @@ func handleLogo(w http.ResponseWriter, r *http.Request) {
 	w.Write(logoBytes)
 }
 
-func parsePDFWithClaude(pdfBytes []byte) ([]ExtractedRow, error) {
-	apiKey := getClaudeAPIKey()
+func parsePDFWithClaude(pdfBytes []byte, apiKey string) ([]ExtractedRow, error) {
+	if apiKey == "" {
+		apiKey = getClaudeAPIKey()
+	}
 	base64PDF := base64.StdEncoding.EncodeToString(pdfBytes)
 
 	prompt := `Anda adalah AI extractor data lembur / SPL (Surat Perintah Lembur). 
@@ -481,7 +537,140 @@ PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILA
 		return nil, fmt.Errorf("API Key Claude tidak memiliki akses API Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (yang diawali dengan 'sk-ant-api03-')")
 	}
 
-	return nil, fmt.Errorf("Gagal memproses PDF dengan AI: %v", lastErr)
+	return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", lastErr)
+}
+
+func parsePDFWithGemini(pdfBytes []byte, apiKey string) ([]ExtractedRow, error) {
+	base64PDF := base64.StdEncoding.EncodeToString(pdfBytes)
+
+	prompt := `Anda adalah AI extractor data lembur / SPL (Surat Perintah Lembur). 
+Silakan baca dokumen PDF ini (yang berupa formulir tulisan tangan atau cetakan) dan ekstrak SEMUA entri data lembur ke dalam JSON array.
+
+Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
+- "emp_name": Nama Karyawan
+- "nik": NIK / Nomor Induk Karyawan (jika tidak ada isi "")
+- "position": Jabatan / Posisi (jika tidak ada isi "")
+- "charge": Tag Charge / Customer / Divisi / Cost Center (contoh: Chg Persol, Chg Coke, CCEP, dll)
+- "date": Tanggal lembur (format YYYY-MM-DD atau sesuai tertera)
+- "day": Nama Hari (contoh: Senin, Selasa, Sab, Jum, dll)
+- "day_category": Kategori Hari (contoh: WD untuk Workday, HO untuk Holiday/Off, AL untuk Annual Leave)
+- "ot_morning_start": Jam Mulai Lembur Pagi (contoh: 06:00, jika tidak ada isi "")
+- "ot_morning_finish": Jam Selesai Lembur Pagi (contoh: 08:00, jika tidak ada isi "")
+- "ot_night_start": Jam Mulai Lembur Malam (contoh: 17:00, jika tidak ada isi "")
+- "ot_night_finish": Jam Selesai Lembur Malam (contoh: 21:00, jika tidak ada isi "")
+- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4, jika tidak ada isi "")`
+
+	reqBody := GeminiReq{
+		Contents: []GeminiContent{
+			{
+				Parts: []GeminiPart{
+					{
+						InlineData: &GeminiInlineData{
+							MimeType: "application/pdf",
+							Data:      base64PDF,
+						},
+					},
+					{
+						Text: prompt,
+					},
+				},
+			},
+		},
+		GenerationConfig: &GeminiGenConfig{
+			ResponseMimeType: "application/json",
+		},
+	}
+
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	models := []string{"gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-pro"}
+	var lastErr error
+
+	for _, model := range models {
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			var gErr GeminiResp
+			_ = json.Unmarshal(respBytes, &gErr)
+			if gErr.Error != nil {
+				lastErr = fmt.Errorf("Gemini API error (%s): %s", model, gErr.Error.Message)
+			} else {
+				lastErr = fmt.Errorf("Gemini API HTTP %d: %s", resp.StatusCode, string(respBytes))
+			}
+			continue
+		}
+
+		var gResp GeminiResp
+		if err := json.Unmarshal(respBytes, &gResp); err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("Gemini API returning empty response")
+			continue
+		}
+
+		rawText := gResp.Candidates[0].Content.Parts[0].Text
+		rawText = strings.TrimSpace(rawText)
+		if idx := strings.Index(rawText, "["); idx != -1 {
+			if lastIdx := strings.LastIndex(rawText, "]"); lastIdx != -1 && lastIdx > idx {
+				rawText = rawText[idx : lastIdx+1]
+			}
+		}
+
+		var rows []ExtractedRow
+		if err := json.Unmarshal([]byte(rawText), &rows); err != nil {
+			lastErr = fmt.Errorf("Gagal parsing JSON output dari Gemini AI (%s): %v", model, err)
+			continue
+		}
+
+		return rows, nil
+	}
+
+	return nil, fmt.Errorf("Gagal memproses PDF dengan Gemini AI: %v", lastErr)
+}
+
+func parsePDFWithAI(pdfBytes []byte) ([]ExtractedRow, error) {
+	geminiKey := getGeminiAPIKey()
+	if geminiKey != "" {
+		return parsePDFWithGemini(pdfBytes, geminiKey)
+	}
+
+	claudeKey := getClaudeAPIKey()
+	if claudeKey != "" {
+		if strings.HasPrefix(claudeKey, "sk-ant-api03-") {
+			return parsePDFWithClaude(pdfBytes, claudeKey)
+		}
+		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
+			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai, bukan API Developer Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (diawali 'sk-ant-api03-') atau atur GEMINI_API_KEY gratis dari https://aistudio.google.com/app/apikey")
+		}
+		return parsePDFWithClaude(pdfBytes, claudeKey)
+	}
+
+	return nil, fmt.Errorf("API Key AI belum dikonfigurasi. Silakan atur GEMINI_API_KEY (Gratis di https://aistudio.google.com/app/apikey) atau CLAUDE_API_KEY (di https://console.anthropic.com)")
 }
 
 type ProcessedResult struct {
@@ -537,8 +726,8 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 		}
 
 		if strings.HasSuffix(lowerName, ".pdf") {
-			// Process PDF with Claude Vision AI
-			pdfRows, err := parsePDFWithClaude(fileBytes)
+			// Process PDF with AI (Gemini or Claude)
+			pdfRows, err := parsePDFWithAI(fileBytes)
 			if err != nil {
 				return nil, fmt.Errorf("gagal membaca PDF '%s': %v", filename, err)
 			}
