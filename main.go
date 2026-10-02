@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xuri/excelize/v2"
@@ -26,12 +27,112 @@ import (
 //go:embed logo.png
 var logoBytes []byte
 
-// Static credentials
+// Session secret
 const (
-	authUsername  = "lia"
-	authPassword  = "422079"
 	sessionSecret = "asisten-payrol-hmac-secret-key-2026-v1"
 )
+
+type UserAccount struct {
+	Username  string `json:"username"`
+	Password  string `json:"password"` // SHA256 hashed
+	CreatedAt string `json:"createdAt"`
+}
+
+var (
+	userMutex sync.RWMutex
+	usersFile = "users.json"
+)
+
+func hashPassword(pass string) string {
+	h := sha256.New()
+	h.Write([]byte("asisten-payrol-salt-2026:" + pass))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func loadUsersLocked() []UserAccount {
+	var users []UserAccount
+	b, err := os.ReadFile(usersFile)
+	if err == nil {
+		_ = json.Unmarshal(b, &users)
+	}
+
+	if len(users) == 0 {
+		users = []UserAccount{
+			{
+				Username:  "lia",
+				Password:  hashPassword("422079"),
+				CreatedAt: time.Now().Format("2006-01-02 15:04"),
+			},
+		}
+		_ = saveUsersLocked(users)
+	}
+	return users
+}
+
+func loadUsers() []UserAccount {
+	userMutex.RLock()
+	defer userMutex.RUnlock()
+	return loadUsersLocked()
+}
+
+func saveUsersLocked(users []UserAccount) error {
+	b, err := json.MarshalIndent(users, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(usersFile, b, 0644)
+}
+
+func validateUserCredentials(username, password string) bool {
+	users := loadUsers()
+	h := hashPassword(password)
+	for _, u := range users {
+		if strings.EqualFold(u.Username, username) && u.Password == h {
+			return true
+		}
+	}
+	return false
+}
+
+func getLoggedInUser(r *http.Request) string {
+	cookie, err := r.Cookie("session")
+	if err != nil || cookie.Value == "" {
+		return ""
+	}
+
+	parts := strings.Split(cookie.Value, "|")
+	if len(parts) != 3 {
+		return ""
+	}
+	user := parts[0]
+	expStr := parts[1]
+	sig := parts[2]
+
+	payload := fmt.Sprintf("%s|%s", user, expStr)
+	h := hmac.New(sha256.New, []byte(sessionSecret))
+	h.Write([]byte(payload))
+	expectedSig := hex.EncodeToString(h.Sum(nil))
+
+	if !hmac.Equal([]byte(sig), []byte(expectedSig)) {
+		return ""
+	}
+
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return ""
+	}
+
+	return user
+}
+
+func generateTokenForUser(username string) string {
+	exp := time.Now().Add(7 * 24 * time.Hour).Unix()
+	payload := fmt.Sprintf("%s|%d", username, exp)
+	h := hmac.New(sha256.New, []byte(sessionSecret))
+	h.Write([]byte(payload))
+	sig := hex.EncodeToString(h.Sum(nil))
+	return fmt.Sprintf("%s|%s", payload, sig)
+}
 
 func getClaudeAPIKey() string {
 	if key := os.Getenv("CLAUDE_API_KEY"); key != "" {
@@ -70,43 +171,21 @@ func getGeminiAPIKey() string {
 }
 
 func generateToken() string {
-	exp := time.Now().Add(7 * 24 * time.Hour).Unix()
-	payload := fmt.Sprintf("%s|%d", authUsername, exp)
-	h := hmac.New(sha256.New, []byte(sessionSecret))
-	h.Write([]byte(payload))
-	sig := hex.EncodeToString(h.Sum(nil))
-	return fmt.Sprintf("%s|%s", payload, sig)
+	return generateTokenForUser("lia")
 }
 
 func isAuthenticated(r *http.Request) bool {
-	cookie, err := r.Cookie("session")
-	if err != nil || cookie.Value == "" {
+	user := getLoggedInUser(r)
+	if user == "" {
 		return false
 	}
-
-	parts := strings.Split(cookie.Value, "|")
-	if len(parts) != 3 {
-		return false
+	users := loadUsers()
+	for _, u := range users {
+		if strings.EqualFold(u.Username, user) {
+			return true
+		}
 	}
-	user := parts[0]
-	expStr := parts[1]
-	sig := parts[2]
-
-	payload := fmt.Sprintf("%s|%s", user, expStr)
-	h := hmac.New(sha256.New, []byte(sessionSecret))
-	h.Write([]byte(payload))
-	expectedSig := hex.EncodeToString(h.Sum(nil))
-
-	if !hmac.Equal([]byte(sig), []byte(expectedSig)) {
-		return false
-	}
-
-	exp, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil || time.Now().Unix() > exp {
-		return false
-	}
-
-	return user == authUsername
+	return false
 }
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -244,6 +323,12 @@ func main() {
 	mux.HandleFunc("/api/preview", authAPIMiddleware(handlePreview))
 	mux.HandleFunc("/api/merge", authAPIMiddleware(handleMerge))
 
+	// User Management API routes
+	mux.HandleFunc("/api/users", authAPIMiddleware(handleGetUsers))
+	mux.HandleFunc("/api/users/create", authAPIMiddleware(handleCreateUser))
+	mux.HandleFunc("/api/users/update-password", authAPIMiddleware(handleUpdatePassword))
+	mux.HandleFunc("/api/users/delete", authAPIMiddleware(handleDeleteUser))
+
 	// Find available listener
 	listener, url, err := createListener()
 	if err != nil {
@@ -318,8 +403,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		user := strings.TrimSpace(r.FormValue("username"))
 		pass := r.FormValue("password")
 
-		if user == authUsername && pass == authPassword {
-			token := generateToken()
+		if validateUserCredentials(user, pass) {
+			token := generateTokenForUser(user)
 			expiry := time.Now().Add(7 * 24 * time.Hour)
 
 			http.SetCookie(w, &http.Cookie{
@@ -357,13 +442,13 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Username != authUsername || req.Password != authPassword {
+	if !validateUserCredentials(req.Username, req.Password) {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Username atau password salah"})
 		return
 	}
 
-	token := generateToken()
+	token := generateTokenForUser(req.Username)
 	expiry := time.Now().Add(7 * 24 * time.Hour)
 
 	http.SetCookie(w, &http.Cookie{
@@ -376,6 +461,182 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 	})
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "user": req.Username})
+}
+
+func handleGetUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	users := loadUsers()
+	type UserDTO struct {
+		Username  string `json:"username"`
+		CreatedAt string `json:"createdAt"`
+		IsCurrent bool   `json:"isCurrent"`
+	}
+	currentUser := getLoggedInUser(r)
+	var dtos []UserDTO
+	for _, u := range users {
+		dtos = append(dtos, UserDTO{
+			Username:  u.Username,
+			CreatedAt: u.CreatedAt,
+			IsCurrent: strings.EqualFold(u.Username, currentUser),
+		})
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"users":       dtos,
+		"currentUser": currentUser,
+	})
+}
+
+func handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Payload tidak valid"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	password := strings.TrimSpace(req.Password)
+	if username == "" || password == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Username dan password tidak boleh kosong"})
+		return
+	}
+
+	userMutex.Lock()
+	defer userMutex.Unlock()
+
+	users := loadUsersLocked()
+	for _, u := range users {
+		if strings.EqualFold(u.Username, username) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Username sudah terdaftar"})
+			return
+		}
+	}
+
+	users = append(users, UserAccount{
+		Username:  username,
+		Password:  hashPassword(password),
+		CreatedAt: time.Now().Format("2006-01-02 15:04"),
+	})
+	if err := saveUsersLocked(users); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Gagal menyimpan user baru"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "User berhasil ditambahkan"})
+}
+
+func handleUpdatePassword(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	var req struct {
+		Username    string `json:"username"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Payload tidak valid"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	newPassword := strings.TrimSpace(req.NewPassword)
+	if username == "" || newPassword == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Username dan password baru tidak boleh kosong"})
+		return
+	}
+
+	userMutex.Lock()
+	defer userMutex.Unlock()
+
+	users := loadUsersLocked()
+	found := false
+	for i, u := range users {
+		if strings.EqualFold(u.Username, username) {
+			users[i].Password = hashPassword(newPassword)
+			found = true
+			break
+		}
+	}
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "User tidak ditemukan"})
+		return
+	}
+
+	if err := saveUsersLocked(users); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Gagal mengupdate password"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Password berhasil diperbarui"})
+}
+
+func handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Payload tidak valid"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	currentUser := getLoggedInUser(r)
+	if strings.EqualFold(username, currentUser) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Anda tidak bisa menghapus akun yang sedang Anda gunakan"})
+		return
+	}
+
+	userMutex.Lock()
+	defer userMutex.Unlock()
+
+	users := loadUsersLocked()
+	var updated []UserAccount
+	found := false
+	for _, u := range users {
+		if strings.EqualFold(u.Username, username) {
+			found = true
+			continue
+		}
+		updated = append(updated, u)
+	}
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "User tidak ditemukan"})
+		return
+	}
+
+	if err := saveUsersLocked(updated); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Gagal menghapus user"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "User berhasil dihapus"})
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -1619,17 +1880,17 @@ body{
 
 .container{
   position:relative;z-index:1;
-  max-width:960px;margin:0 auto;padding:40px 24px 60px;
+  max-width:1040px;margin:0 auto;padding:40px 24px 60px;
 }
 
 /* Header */
-.header{text-align:center;margin-bottom:48px}
+.header{text-align:center;margin-bottom:36px}
 .logo{
   display:inline-flex;align-items:center;gap:14px;
-  margin-bottom:16px;
+  margin-bottom:12px;
 }
 .logo-icon{
-  width:64px;height:64px;border-radius:18px;
+  width:60px;height:60px;border-radius:18px;
   display:flex;align-items:center;justify-content:center;
   overflow:hidden;
   box-shadow:0 6px 24px var(--accent-glow);
@@ -1642,7 +1903,34 @@ body{
   background-clip:text;
   letter-spacing:-.5px;
 }
-.header p{color:var(--text-secondary);font-size:15px;font-weight:400;line-height:1.5}
+.header p{color:var(--text-secondary);font-size:14px;font-weight:400;line-height:1.5}
+
+/* Nav tabs */
+.nav-tabs{
+  display:inline-flex;align-items:center;gap:8px;
+  background:rgba(17,24,39,.7);
+  backdrop-filter:blur(16px);
+  border:1px solid var(--border);
+  border-radius:30px;
+  padding:6px;
+  margin-top:20px;
+  box-shadow:0 8px 24px rgba(0,0,0,.2);
+}
+.nav-btn{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:10px 24px;
+  background:transparent;
+  border:none;border-radius:24px;
+  color:var(--text-secondary);
+  font-size:14px;font-weight:600;font-family:inherit;
+  cursor:pointer;transition:all .25s;
+}
+.nav-btn:hover{color:var(--text-primary);background:rgba(236,72,153,.1)}
+.nav-btn.active{
+  background:var(--gradient-1);
+  color:#fff;
+  box-shadow:0 4px 16px var(--accent-glow);
+}
 
 /* Card */
 .card{
@@ -1798,7 +2086,7 @@ input[type=file]{display:none}
   border-bottom:2px solid var(--accent);
 }
 .preview-table td{
-  padding:10px 16px;
+  padding:12px 16px;
   border-bottom:1px solid var(--border);
   white-space:nowrap;
   color:var(--text-secondary);
@@ -1826,9 +2114,9 @@ input[type=file]{display:none}
 .actions.visible{display:flex}
 .btn{
   display:inline-flex;align-items:center;gap:10px;
-  padding:14px 32px;
+  padding:12px 24px;
   border:none;border-radius:var(--radius-sm);
-  font-size:15px;font-weight:600;font-family:inherit;
+  font-size:14px;font-weight:600;font-family:inherit;
   cursor:pointer;transition:all .25s;
   position:relative;overflow:hidden;
 }
@@ -1849,6 +2137,7 @@ input[type=file]{display:none}
   border:1px solid var(--border);
 }
 .btn-secondary:hover{border-color:var(--accent);background:var(--bg-card-hover)}
+.btn-sm{padding:6px 14px;font-size:12px;border-radius:8px}
 
 /* Loading spinner */
 .spinner{
@@ -1868,7 +2157,7 @@ input[type=file]{display:none}
 
 /* Toast */
 .toast{
-  position:fixed;bottom:32px;right:32px;z-index:100;
+  position:fixed;bottom:32px;right:32px;z-index:300;
   display:flex;align-items:center;gap:12px;
   padding:14px 24px;
   background:var(--bg-card);
@@ -1880,9 +2169,61 @@ input[type=file]{display:none}
   transition:all .4s cubic-bezier(.16,1,.3,1);
 }
 .toast.show{transform:translateY(0);opacity:1}
-.toast.toast-success{border-color:rgba(16,185,129,.3)}
-.toast.toast-error{border-color:rgba(239,68,68,.3)}
+.toast.toast-success{border-color:rgba(16,185,129,.4);box-shadow:0 10px 30px rgba(16,185,129,.2)}
+.toast.toast-error{border-color:rgba(239,68,68,.4);box-shadow:0 10px 30px rgba(239,68,68,.2)}
 .toast-icon{font-size:20px}
+
+/* Modal styling */
+.modal-overlay{
+  position:fixed;inset:0;z-index:200;
+  background:rgba(10,14,26,.82);
+  backdrop-filter:blur(10px);
+  display:none;align-items:center;justify-content:center;
+  padding:20px;
+}
+.modal-overlay.visible{display:flex}
+.modal-card{
+  background:var(--bg-card);
+  border:1px solid var(--border-glow);
+  border-radius:var(--radius);
+  padding:32px;
+  width:100%;max-width:440px;
+  box-shadow:var(--shadow-lg);
+  animation:modalIn .3s cubic-bezier(.16,1,.3,1);
+}
+@keyframes modalIn{from{opacity:0;transform:scale(.94) translateY(12px)}}
+.modal-header{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:20px;
+}
+.modal-header h3{font-size:18px;font-weight:700;color:var(--text-primary)}
+.modal-close{
+  background:none;border:none;color:var(--text-muted);
+  font-size:20px;cursor:pointer;padding:4px;
+  border-radius:50%;transition:color .2s;
+}
+.modal-close:hover{color:#fff}
+
+.form-group{margin-bottom:18px}
+.form-label{
+  display:block;font-size:11.5px;font-weight:600;
+  color:var(--text-secondary);margin-bottom:6px;
+  text-transform:uppercase;letter-spacing:.8px;
+}
+.form-input{
+  width:100%;
+  padding:12px 16px;
+  background:rgba(17,24,39,.6);
+  border:1.5px solid var(--border);
+  border-radius:var(--radius-sm);
+  color:var(--text-primary);
+  font-size:14px;font-family:inherit;font-weight:500;
+  outline:none;transition:all .3s;
+}
+.form-input:focus{
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(236,72,153,.2);
+}
 
 /* Footer */
 .footer{
@@ -1898,8 +2239,9 @@ input[type=file]{display:none}
   .card{padding:24px 20px}
   .drop-zone{padding:40px 20px}
   .logo-text{font-size:22px}
-  .btn{padding:12px 24px;font-size:14px}
+  .btn{padding:10px 20px;font-size:13.5px}
   .stat-chip{min-width:120px}
+  .nav-btn{padding:8px 16px;font-size:13px}
 }
 </style>
 </head>
@@ -1917,13 +2259,36 @@ input[type=file]{display:none}
       <div class="logo-icon"><img src="/logo.png" alt="Asisten Payroll Logo"></div>
       <span class="logo-text">Asisten Payrol</span>
     </div>
-    <p>Upload file Excel &amp; PDF lembur karyawan (termasuk formulir tulisan tangan),<br>gabungkan semua data jadi satu tabel rapi secara otomatis dengan Claude AI.</p>
+    <p>Sistem Penggabungan Data Lembur Karyawan &amp; Manajemen User Akses</p>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="nav-btn active" id="tabMerge" onclick="switchTab('merge')">
+        <span>📊</span> Merge Data Lembur
+      </button>
+      <button class="nav-btn" id="tabUsers" onclick="switchTab('users')">
+        <span>👥</span> Master User
+      </button>
+    </nav>
   </header>
 
-  <div style="position:fixed;top:20px;right:24px;z-index:50">
+  <!-- User Profile & Logout Header -->
+  <div style="position:fixed;top:20px;right:24px;z-index:50;display:flex;align-items:center;gap:10px">
+    <div class="user-badge" id="userBadge" style="
+      display:inline-flex;align-items:center;gap:8px;
+      padding:8px 16px;
+      background:rgba(26,32,53,.7);
+      backdrop-filter:blur(12px);
+      border:1px solid var(--border);
+      border-radius:10px;
+      color:var(--accent-hover);
+      font-size:13px;font-weight:600;
+    ">
+      <span>👤</span> <span id="currentUsername">...</span>
+    </div>
     <a href="/api/logout" id="logoutBtn" style="
       display:inline-flex;align-items:center;gap:8px;
-      padding:8px 18px;
+      padding:8px 16px;
       background:rgba(26,32,53,.7);
       backdrop-filter:blur(12px);
       border:1px solid var(--border);
@@ -1938,77 +2303,181 @@ input[type=file]{display:none}
     </a>
   </div>
 
-  <div class="card">
-    <div class="drop-zone" id="dropZone">
-      <div class="drop-icon">📁</div>
-      <div class="drop-title">Drag &amp; drop file Excel (.xlsx) atau PDF di sini</div>
-      <div class="drop-subtitle">atau klik tombol di bawah untuk memilih file (.xlsx, .pdf) &bull; dukung baca formulir PDF tulisan tangan dengan AI</div>
-      <button class="drop-btn" id="browseBtn">
-        <span>📎</span> Pilih File Excel / PDF (Multiple)
+  <!-- MENU 1: MERGE DATA LEMBUR -->
+  <div id="menuMerge">
+    <div class="card">
+      <div class="drop-zone" id="dropZone">
+        <div class="drop-icon">📁</div>
+        <div class="drop-title">Drag &amp; drop file Excel (.xlsx) atau PDF di sini</div>
+        <div class="drop-subtitle">atau klik tombol di bawah untuk memilih file (.xlsx, .pdf) &bull; dukung baca formulir PDF tulisan tangan dengan AI</div>
+        <button class="drop-btn" id="browseBtn">
+          <span>📎</span> Pilih File Excel / PDF (Multiple)
+        </button>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.pdf" multiple>
+
+        <div class="file-list" id="fileList"></div>
+      </div>
+    </div>
+
+    <div class="stats-bar" id="statsBar">
+      <div class="stat-chip">
+        <span class="stat-chip-icon">📁</span>
+        <span class="stat-chip-label">Total File</span>
+        <span class="stat-chip-value" id="statFiles">0</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-chip-icon">👥</span>
+        <span class="stat-chip-label">Karyawan</span>
+        <span class="stat-chip-value" id="statSheets">0</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-chip-icon">📋</span>
+        <span class="stat-chip-label">Total Baris</span>
+        <span class="stat-chip-value" id="statRows">0</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-chip-icon">📊</span>
+        <span class="stat-chip-label">Kolom</span>
+        <span class="stat-chip-value" id="statCols">0</span>
+      </div>
+    </div>
+
+    <div class="sheet-list" id="sheetList"></div>
+
+    <div class="preview-label" id="previewLabel">
+      <span>👁️</span> Preview data gabungan (Excel + PDF)
+    </div>
+    <div class="table-wrapper" id="tableWrapper">
+      <table class="preview-table" id="previewTable">
+        <thead id="previewHead"></thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+    </div>
+
+    <div class="spinner" id="spinner">
+      <div class="spinner-ring"></div>
+      <div class="spinner-text" id="spinnerText">Memproses file Excel &amp; PDF dengan AI...</div>
+    </div>
+
+    <div class="actions" id="actions">
+      <button class="btn btn-primary" id="downloadBtn">
+        <span>⬇️</span> Download Hasil Gabungan
       </button>
-      <input type="file" id="fileInput" accept=".xlsx,.xls,.pdf" multiple>
-
-      <div class="file-list" id="fileList"></div>
+      <button class="btn btn-secondary" id="resetBtn">
+        <span>🔄</span> Upload Ulang
+      </button>
     </div>
   </div>
 
-  <div class="stats-bar" id="statsBar">
-    <div class="stat-chip">
-      <span class="stat-chip-icon">📁</span>
-      <span class="stat-chip-label">Total File</span>
-      <span class="stat-chip-value" id="statFiles">0</span>
-    </div>
-    <div class="stat-chip">
-      <span class="stat-chip-icon">👥</span>
-      <span class="stat-chip-label">Karyawan</span>
-      <span class="stat-chip-value" id="statSheets">0</span>
-    </div>
-    <div class="stat-chip">
-      <span class="stat-chip-icon">📋</span>
-      <span class="stat-chip-label">Total Baris</span>
-      <span class="stat-chip-value" id="statRows">0</span>
-    </div>
-    <div class="stat-chip">
-      <span class="stat-chip-icon">📊</span>
-      <span class="stat-chip-label">Kolom</span>
-      <span class="stat-chip-value" id="statCols">0</span>
+  <!-- MENU 2: MASTER USER -->
+  <div id="menuUsers" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px">
+        <div>
+          <h2 style="font-size:20px;font-weight:700;color:var(--text-primary);display:flex;align-items:center;gap:10px">
+            <span>👥</span> Master User
+          </h2>
+          <p style="font-size:13px;color:var(--text-secondary);margin-top:4px">Kelola akun pengguna yang diberikan akses untuk masuk ke sistem</p>
+        </div>
+        <button class="btn btn-primary" onclick="openAddUserModal()" style="margin-left:auto">
+          <span>➕</span> Tambah User Baru
+        </button>
+      </div>
+
+      <div class="table-wrapper visible" style="max-height:500px">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Tanggal Dibuat</th>
+              <th>Status</th>
+              <th style="text-align:right">Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="userTableBody">
+            <!-- Dynamically loaded -->
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
-  <div class="sheet-list" id="sheetList"></div>
-
-  <div class="preview-label" id="previewLabel">
-    <span>👁️</span> Preview data gabungan (Excel + PDF)
-  </div>
-  <div class="table-wrapper" id="tableWrapper">
-    <table class="preview-table" id="previewTable">
-      <thead id="previewHead"></thead>
-      <tbody id="previewBody"></tbody>
-    </table>
-  </div>
-
-  <div class="spinner" id="spinner">
-    <div class="spinner-ring"></div>
-    <div class="spinner-text" id="spinnerText">Memproses file Excel &amp; PDF dengan AI...</div>
-  </div>
-
-  <div class="actions" id="actions">
-    <button class="btn btn-primary" id="downloadBtn">
-      <span>⬇️</span> Download Hasil Gabungan
-    </button>
-    <button class="btn btn-secondary" id="resetBtn">
-      <span>🔄</span> Upload Ulang
-    </button>
-  </div>
 </div>
 
+<!-- FOOTER -->
 <div class="footer">
-  <p>Asisten Payrol &mdash; dibuat dengan ❤️ menggunakan Go + Excelize + Claude AI</p>
+  <p>Asisten Payrol &mdash; dibuat dengan ❤️ menggunakan Go + Excelize + Gemini/Claude AI</p>
 </div>
 
+<!-- TOAST NOTIFICATION -->
 <div class="toast" id="toast">
   <span class="toast-icon" id="toastIcon"></span>
   <span id="toastMsg"></span>
+</div>
+
+<!-- MODAL OVERLAY -->
+<div class="modal-overlay" id="modalOverlay" onclick="closeModalOnOverlay(event)">
+  <!-- Modal 1: Add User -->
+  <div class="modal-card" id="modalAddUser" style="display:none">
+    <div class="modal-header">
+      <h3>➕ Tambah User Baru</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <form id="formAddUser" onsubmit="submitAddUser(event)">
+      <div class="form-group">
+        <label class="form-label">Username</label>
+        <input class="form-input" type="text" id="addUsername" placeholder="Masukkan username" required autocomplete="off">
+      </div>
+      <div class="form-group" style="margin-bottom:24px">
+        <label class="form-label">Password</label>
+        <input class="form-input" type="password" id="addPassword" placeholder="Masukkan password" required autocomplete="new-password">
+      </div>
+      <div style="display:flex;gap:12px;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" onclick="closeModal()">Batal</button>
+        <button type="submit" class="btn btn-primary" id="btnAddUserSubmit">Simpan User</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Modal 2: Edit Password -->
+  <div class="modal-card" id="modalEditPw" style="display:none">
+    <div class="modal-header">
+      <h3>🔑 Ubah Password User</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <form id="formEditPw" onsubmit="submitEditPw(event)">
+      <input type="hidden" id="editPwUsername">
+      <div class="form-group">
+        <label class="form-label">User</label>
+        <input class="form-input" style="background:rgba(255,255,255,.05);color:var(--text-muted)" type="text" id="editPwUsernameDisplay" readonly>
+      </div>
+      <div class="form-group" style="margin-bottom:24px">
+        <label class="form-label">Password Baru</label>
+        <input class="form-input" type="password" id="editNewPassword" placeholder="Masukkan password baru" required autocomplete="new-password">
+      </div>
+      <div style="display:flex;gap:12px;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" onclick="closeModal()">Batal</button>
+        <button type="submit" class="btn btn-primary" id="btnEditPwSubmit">Update Password</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Modal 3: Confirm Delete -->
+  <div class="modal-card" id="modalDelete" style="display:none">
+    <div class="modal-header">
+      <h3 style="color:#f87171">🗑️ Hapus User</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div style="margin-bottom:24px">
+      <p style="font-size:14px;color:var(--text-secondary)">Apakah Anda yakin ingin menghapus user <strong id="deleteUsernameDisplay" style="color:#fff"></strong>?</p>
+      <p style="font-size:12px;color:var(--text-muted);margin-top:6px">Tindakan ini tidak dapat dibatalkan.</p>
+    </div>
+    <input type="hidden" id="deleteUsername">
+    <div style="display:flex;gap:12px;justify-content:flex-end">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">Batal</button>
+      <button type="button" class="btn" style="background:var(--danger);color:#fff" id="btnDeleteSubmit" onclick="submitDeleteUser()">Ya, Hapus</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -2029,6 +2498,23 @@ const downloadBtn = $('downloadBtn');
 const resetBtn = $('resetBtn');
 
 let selectedFiles = [];
+let activeTab = 'merge';
+
+function switchTab(tab) {
+  activeTab = tab;
+  if (tab === 'merge') {
+    $('tabMerge').className = 'nav-btn active';
+    $('tabUsers').className = 'nav-btn';
+    $('menuMerge').style.display = 'block';
+    $('menuUsers').style.display = 'none';
+  } else {
+    $('tabMerge').className = 'nav-btn';
+    $('tabUsers').className = 'nav-btn active';
+    $('menuMerge').style.display = 'none';
+    $('menuUsers').style.display = 'block';
+    loadUserTable();
+  }
+}
 
 // Drag & drop
 ['dragenter','dragover'].forEach(ev => {
@@ -2117,7 +2603,7 @@ async function previewFiles() {
   if (selectedFiles.length === 0) return;
   
   const hasPDF = selectedFiles.some(f => f.name.match(/\.pdf$/i));
-  $('spinnerText').textContent = hasPDF ? 'Membaca formulir PDF dengan Claude AI & Excel...' : 'Memproses file Excel...';
+  $('spinnerText').textContent = hasPDF ? 'Membaca formulir PDF dengan Gemini/Claude AI & Excel...' : 'Memproses file Excel...';
   
   spinner.classList.add('visible');
   actions.classList.remove('visible');
@@ -2244,6 +2730,176 @@ function resetAll() {
   sheetList.innerHTML = '';
 }
 
+// User Management Logic
+async function loadUserTable() {
+  try {
+    const resp = await fetch('/api/users');
+    const data = await resp.json();
+    if (!data.success) return;
+
+    $('currentUsername').textContent = data.currentUser || 'User';
+
+    const tbody = $('userTableBody');
+    tbody.innerHTML = '';
+
+    data.users.forEach(u => {
+      const tr = document.createElement('tr');
+      
+      const badge = u.isCurrent 
+        ? '<span style="background:rgba(16,185,129,.15);color:#10b981;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:600">Aktif (Saya)</span>' 
+        : '';
+        
+      tr.innerHTML = 
+        '<td><strong>' + escapeHtml(u.Username) + '</strong>' + badge + '</td>' +
+        '<td>' + escapeHtml(u.CreatedAt || '-') + '</td>' +
+        '<td><span style="color:#10b981">● Active</span></td>' +
+        '<td style="text-align:right;white-space:nowrap">' +
+          '<button class="btn btn-secondary btn-sm" onclick="openEditPwModal(\'' + escapeHtml(u.Username) + '\')" style="margin-right:6px">🔑 Ubah Password</button>' +
+          (u.isCurrent 
+            ? '<button class="btn btn-secondary btn-sm" disabled style="opacity:.4;cursor:not-allowed">🗑️ Hapus</button>' 
+            : '<button class="btn btn-sm" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)" onclick="openDeleteModal(\'' + escapeHtml(u.Username) + '\')">🗑️ Hapus</button>') +
+        '</td>';
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    showToast('❌', 'Gagal memuat daftar user', 'error');
+  }
+}
+
+// Modal Helpers
+function openAddUserModal() {
+  $('addUsername').value = '';
+  $('addPassword').value = '';
+  $('modalAddUser').style.display = 'block';
+  $('modalEditPw').style.display = 'none';
+  $('modalDelete').style.display = 'none';
+  $('modalOverlay').classList.add('visible');
+  setTimeout(() => $('addUsername').focus(), 100);
+}
+
+function openEditPwModal(username) {
+  $('editPwUsername').value = username;
+  $('editPwUsernameDisplay').value = username;
+  $('editNewPassword').value = '';
+  $('modalAddUser').style.display = 'none';
+  $('modalEditPw').style.display = 'block';
+  $('modalDelete').style.display = 'none';
+  $('modalOverlay').classList.add('visible');
+  setTimeout(() => $('editNewPassword').focus(), 100);
+}
+
+function openDeleteModal(username) {
+  $('deleteUsername').value = username;
+  $('deleteUsernameDisplay').textContent = username;
+  $('modalAddUser').style.display = 'none';
+  $('modalEditPw').style.display = 'none';
+  $('modalDelete').style.display = 'block';
+  $('modalOverlay').classList.add('visible');
+}
+
+function closeModal() {
+  $('modalOverlay').classList.remove('visible');
+}
+
+function closeModalOnOverlay(e) {
+  if (e.target === $('modalOverlay')) closeModal();
+}
+
+async function submitAddUser(e) {
+  e.preventDefault();
+  const username = $('addUsername').value.trim();
+  const password = $('addPassword').value;
+
+  if (!username || !password) {
+    showToast('⚠️', 'Username dan password wajib diisi', 'error');
+    return;
+  }
+
+  $('btnAddUserSubmit').disabled = true;
+  try {
+    const resp = await fetch('/api/users/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await resp.json();
+    if (data.success) {
+      showToast('✅', 'User baru berhasil ditambahkan!', 'success');
+      closeModal();
+      loadUserTable();
+    } else {
+      showToast('❌', data.error || 'Gagal menambahkan user', 'error');
+    }
+  } catch (err) {
+    showToast('❌', err.message, 'error');
+  } finally {
+    $('btnAddUserSubmit').disabled = false;
+  }
+}
+
+async function submitEditPw(e) {
+  e.preventDefault();
+  const username = $('editPwUsername').value;
+  const newPassword = $('editNewPassword').value;
+
+  if (!newPassword) {
+    showToast('⚠️', 'Password baru wajib diisi', 'error');
+    return;
+  }
+
+  $('btnEditPwSubmit').disabled = true;
+  try {
+    const resp = await fetch('/api/users/update-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, newPassword})
+    });
+    const data = await resp.json();
+    if (data.success) {
+      showToast('✅', 'Password berhasil diperbarui!', 'success');
+      closeModal();
+      loadUserTable();
+    } else {
+      showToast('❌', data.error || 'Gagal mengubah password', 'error');
+    }
+  } catch (err) {
+    showToast('❌', err.message, 'error');
+  } finally {
+    $('btnEditPwSubmit').disabled = false;
+  }
+}
+
+async function submitDeleteUser() {
+  const username = $('deleteUsername').value;
+  $('btnDeleteSubmit').disabled = true;
+  try {
+    const resp = await fetch('/api/users/delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username})
+    });
+    const data = await resp.json();
+    if (data.success) {
+      showToast('✅', 'User berhasil dihapus!', 'success');
+      closeModal();
+      loadUserTable();
+    } else {
+      showToast('❌', data.error || 'Gagal menghapus user', 'error');
+    }
+  } catch (err) {
+    showToast('❌', err.message, 'error');
+  } finally {
+    $('btnDeleteSubmit').disabled = false;
+  }
+}
+
+// Initial load for active user badge
+fetch('/api/users').then(r => r.json()).then(data => {
+  if (data.currentUser) {
+    $('currentUsername').textContent = data.currentUser;
+  }
+}).catch(() => {});
+
 let toastTimer;
 function showToast(icon, msg, type) {
   const toast = $('toast');
@@ -2257,3 +2913,4 @@ function showToast(icon, msg, type) {
 </body>
 </html>
 `
+
