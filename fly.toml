@@ -1,23 +1,26 @@
-# fly.toml app configuration file for Merge Lembur
-# See https://fly.io/docs/reference/configuration/ for options
+# fly.toml app configuration file generated for asistenpayr on 2026-10-02T04:31:58Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = "asistenpayr"
 primary_region = "sin" # Singapore (super fast latency for Indonesia)
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
+  PORT = '8080'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
+  memory = '256mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
