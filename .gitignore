@@ -15,6 +15,7 @@ tmp/
 scratch/
 .env
 claude_key.txt
+gemini_key.txt
 
 # OS / IDE
 .DS_Store

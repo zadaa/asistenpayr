@@ -586,7 +586,7 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 		return nil, err
 	}
 
-	models := []string{"gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-pro"}
+	models := []string{"gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"}
 	var lastErr error
 
 	for _, model := range models {
