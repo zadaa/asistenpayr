@@ -751,7 +751,7 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 					pr.NIK,
 					pr.Position,
 					pr.Charge,
-					filename,
+					"PDF",
 					dateVal,
 					pr.Day,
 					pr.DayCategory,
@@ -855,13 +855,12 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 						dateVal = t.Format("2006-01-02")
 					}
 
-					sourceStr := fmt.Sprintf("%s (%s)", filename, sheetName)
 					outRow := []string{
 						empName,
 						nik,
 						position,
 						chargeTag,
-						sourceStr,
+						"EXCEL",
 						dateVal,
 						getCell(row, 1),
 						getCell(row, 2),
