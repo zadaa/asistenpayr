@@ -108,7 +108,7 @@ func main() {
 	}
 
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║          MERGE LEMBUR - Penggabung Data Lembur         ║")
+	fmt.Println("║         ASISTEN PAYROL - Penggabung Data Lembur        ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  🌐 Buka browser: %-38s ║\n", url)
 	fmt.Println("║  ⏹  Tekan Ctrl+C untuk berhenti                        ║")
@@ -863,7 +863,7 @@ const loginHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Login — Merge Lembur</title>
+<title>Login — Asisten Payrol</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -1069,7 +1069,7 @@ body{
   <div class="login-card">
     <div class="login-header">
       <div class="login-logo">📊</div>
-      <div class="login-title">Merge Lembur</div>
+      <div class="login-title">Asisten Payrol</div>
       <div class="login-subtitle">Silakan login untuk melanjutkan</div>
     </div>
 
@@ -1181,7 +1181,7 @@ const indexHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Merge Lembur — Penggabung Data Lembur</title>
+<title>Asisten Payrol — Penggabung Data Lembur</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -1549,7 +1549,7 @@ input[type=file]{display:none}
   <header class="header">
     <div class="logo">
       <div class="logo-icon">📊</div>
-      <span class="logo-text">Merge Lembur</span>
+      <span class="logo-text">Asisten Payrol</span>
     </div>
     <p>Upload file Excel lembur karyawan (multi-sheet),<br>gabungkan jadi satu tabel rapi dalam sekali klik.</p>
   </header>
@@ -1637,7 +1637,7 @@ input[type=file]{display:none}
 </div>
 
 <div class="footer">
-  <p>Merge Lembur &mdash; dibuat dengan ❤️ menggunakan Go + Excelize</p>
+  <p>Asisten Payrol &mdash; dibuat dengan ❤️ menggunakan Go + Excelize</p>
 </div>
 
 <div class="toast" id="toast">

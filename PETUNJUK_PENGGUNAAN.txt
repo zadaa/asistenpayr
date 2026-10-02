@@ -1,5 +1,5 @@
 ====================================================================
-                  PETUNJUK APLIKASI MERGE LEMBUR
+                  PETUNJUK APLIKASI ASISTEN PAYROL
 ====================================================================
 
 Aplikasi ini digunakan untuk menyatukan sheet data lembur karyawan 
