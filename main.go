@@ -2546,7 +2546,8 @@ input[type=file]{display:none}
 <!-- TOAST NOTIFICATION -->
 <div class="toast" id="toast">
   <span class="toast-icon" id="toastIcon"></span>
-  <span id="toastMsg"></span>
+  <span id="toastMsg" style="flex:1"></span>
+  <button type="button" onclick="hideToast()" title="Tutup" style="background:none;border:none;color:var(--text-muted);font-size:16px;cursor:pointer;padding:2px 6px;border-radius:4px;line-height:1;margin-left:8px" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-muted)'">✕</button>
 </div>
 
 <!-- MODAL OVERLAY -->
@@ -2747,6 +2748,7 @@ function addFiles(files) {
 
 function removeFile(index) {
   selectedFiles.splice(index, 1);
+  fileInput.value = '';
   renderFileList();
   if (selectedFiles.length > 0) {
     previewFiles();
@@ -2773,7 +2775,7 @@ function renderFileList() {
         '<div class="file-item-name">' + escapeHtml(file.name) + (isPDF ? ' <span style="font-size:10px;background:#ec4899;color:#fff;padding:1px 6px;border-radius:6px;margin-left:4px">PDF AI</span>' : '') + '</div>' +
         '<div class="file-item-size">' + formatBytes(file.size) + '</div>' +
       '</div>' +
-      '<button class="file-item-remove" title="Hapus file" onclick="event.stopPropagation(); removeFile(' + idx + ')">✕</button>';
+      '<button type="button" class="file-item-remove" title="Hapus file" onclick="event.stopPropagation(); event.preventDefault(); removeFile(' + idx + ')">✕</button>';
     fileList.appendChild(item);
   });
   fileList.classList.add('visible');
@@ -3191,13 +3193,21 @@ fetch('/api/users')
   .catch(() => {});
 
 let toastTimer;
+function hideToast() {
+  const toast = $('toast');
+  toast.classList.remove('show');
+  clearTimeout(toastTimer);
+}
+
 function showToast(icon, msg, type) {
   const toast = $('toast');
   $('toastIcon').textContent = icon;
   $('toastMsg').textContent = msg;
   toast.className = 'toast toast-' + type + ' show';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { toast.classList.remove('show'); }, 4000);
+  if (type !== 'error') {
+    toastTimer = setTimeout(() => { toast.classList.remove('show'); }, 6000);
+  }
 }
 </script>
 </body>
