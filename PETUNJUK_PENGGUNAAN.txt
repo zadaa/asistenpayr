@@ -1,0 +1,37 @@
+====================================================================
+                  PETUNJUK APLIKASI MERGE LEMBUR
+====================================================================
+
+Aplikasi ini digunakan untuk menyatukan sheet data lembur karyawan 
+dari satu atau beberapa file Excel sekaligus menjadi 1 sheet gabungan 
+yang rapi.
+
+--------------------------------------------------------------------
+1. CARA MENJALANKAN:
+--------------------------------------------------------------------
+- Double click / buka file "Jalankan Aplikasi.bat" atau "MergeLembur.exe"
+- Browser akan otomatis terbuka menuju halaman web aplikasi.
+
+--------------------------------------------------------------------
+2. INFORMASI LOGIN:
+--------------------------------------------------------------------
+  Username : lia
+  Password : 422079
+
+--------------------------------------------------------------------
+3. CARA PENGGUNAAN:
+--------------------------------------------------------------------
+  a. Select atau Drag & Drop file Excel lembur (.xlsx).
+     * BISA UPLOAD BANYAK FILE SEKALIGUS (MULTIPLE FILE UPLOAD).
+  b. Data akan otomatis diproses dan menampilkan preview gabungan 
+     (termasuk deteksi Nama Karyawan, NIK, Position, dan Tag Charge).
+  c. Klik "Download Hasil Gabungan" untuk mengunduh file Excel hasil 
+     gabungan (.xlsx) dengan tabel berdesain Pink yang rapi.
+
+--------------------------------------------------------------------
+CATATAN TAMBAHAN:
+--------------------------------------------------------------------
+- Aplikasi ini 100% standalone (tidak perlu install Go / Python / Excel).
+- Jangan tutup jendela hitam (console) saat aplikasi sedang digunakan.
+- Untuk menutup aplikasi, cukup tutup jendela console atau tekan Ctrl+C.
+====================================================================

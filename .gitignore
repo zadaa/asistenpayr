@@ -1,0 +1,22 @@
+# Executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# App packages & temp files
+*.zip
+*.xlsx
+hasil_*.xlsx
+test_*.xlsx
+contoh_*.xlsx
+tmp/
+scratch/
+.env
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

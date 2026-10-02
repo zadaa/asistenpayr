@@ -1,0 +1,8 @@
+.git
+.github
+*.exe
+*.zip
+*.bat
+*.xlsx
+scratch
+tmp
