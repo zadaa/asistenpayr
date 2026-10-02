@@ -2734,8 +2734,18 @@ function resetAll() {
 async function loadUserTable() {
   try {
     const resp = await fetch('/api/users');
+    if (resp.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
+    if (!resp.ok) {
+      throw new Error('HTTP ' + resp.status);
+    }
     const data = await resp.json();
-    if (!data.success) return;
+    if (!data.success) {
+      showToast('❌', data.error || 'Gagal memuat daftar user', 'error');
+      return;
+    }
 
     $('currentUsername').textContent = data.currentUser || 'User';
 
@@ -2762,7 +2772,7 @@ async function loadUserTable() {
       tbody.appendChild(tr);
     });
   } catch (err) {
-    showToast('❌', 'Gagal memuat daftar user', 'error');
+    showToast('❌', 'Gagal memuat daftar user: ' + err.message, 'error');
   }
 }
 
@@ -2822,6 +2832,7 @@ async function submitAddUser(e) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username, password})
     });
+    if (resp.status === 401) { window.location.href = '/login'; return; }
     const data = await resp.json();
     if (data.success) {
       showToast('✅', 'User baru berhasil ditambahkan!', 'success');
@@ -2854,6 +2865,7 @@ async function submitEditPw(e) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username, newPassword})
     });
+    if (resp.status === 401) { window.location.href = '/login'; return; }
     const data = await resp.json();
     if (data.success) {
       showToast('✅', 'Password berhasil diperbarui!', 'success');
@@ -2878,6 +2890,7 @@ async function submitDeleteUser() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username})
     });
+    if (resp.status === 401) { window.location.href = '/login'; return; }
     const data = await resp.json();
     if (data.success) {
       showToast('✅', 'User berhasil dihapus!', 'success');
@@ -2894,11 +2907,17 @@ async function submitDeleteUser() {
 }
 
 // Initial load for active user badge
-fetch('/api/users').then(r => r.json()).then(data => {
-  if (data.currentUser) {
-    $('currentUsername').textContent = data.currentUser;
-  }
-}).catch(() => {});
+fetch('/api/users')
+  .then(r => {
+    if (r.status === 401) { window.location.href = '/login'; return null; }
+    return r.json();
+  })
+  .then(data => {
+    if (data && data.currentUser) {
+      $('currentUsername').textContent = data.currentUser;
+    }
+  })
+  .catch(() => {});
 
 let toastTimer;
 function showToast(icon, msg, type) {
