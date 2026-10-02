@@ -33,7 +33,7 @@ const (
 )
 
 // Default Claude API key provided by user
-const defaultClaudeAPIKey = "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"
+const defaultClaudeAPIKey = "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"
 
 func getClaudeAPIKey() string {
 	if key := os.Getenv("CLAUDE_API_KEY"); key != "" {
@@ -465,6 +465,11 @@ PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILA
 		}
 
 		return rows, nil
+	}
+
+	errMsg := fmt.Sprintf("%v", lastErr)
+	if strings.Contains(errMsg, "authentication_error") || strings.Contains(errMsg, "not_found_error") || strings.Contains(errMsg, "invalid") || strings.HasPrefix(apiKey, "sk-ant-usr-") {
+		return nil, fmt.Errorf("API Key Claude tidak memiliki akses API Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (yang diawali dengan 'sk-ant-api03-')")
 	}
 
 	return nil, fmt.Errorf("Gagal memproses PDF dengan AI: %v", lastErr)
