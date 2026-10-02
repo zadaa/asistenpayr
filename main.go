@@ -33,9 +33,10 @@ const (
 )
 
 type UserAccount struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"` // SHA256 hashed
-	CreatedAt string `json:"createdAt"`
+	Username    string   `json:"username"`
+	Password    string   `json:"password"` // SHA256 hashed
+	CreatedAt   string   `json:"createdAt"`
+	Permissions []string `json:"permissions"` // e.g. ["merge", "users"]
 }
 
 var (
@@ -56,12 +57,23 @@ func loadUsersLocked() []UserAccount {
 		_ = json.Unmarshal(b, &users)
 	}
 
+	for i := range users {
+		if len(users[i].Permissions) == 0 {
+			if strings.EqualFold(users[i].Username, "lia") {
+				users[i].Permissions = []string{"merge", "users"}
+			} else {
+				users[i].Permissions = []string{"merge"}
+			}
+		}
+	}
+
 	if len(users) == 0 {
 		users = []UserAccount{
 			{
-				Username:  "lia",
-				Password:  hashPassword("422079"),
-				CreatedAt: time.Now().Format("2006-01-02 15:04"),
+				Username:    "lia",
+				Password:    hashPassword("422079"),
+				CreatedAt:   time.Now().Format("2006-01-02 15:04"),
+				Permissions: []string{"merge", "users"},
 			},
 		}
 		_ = saveUsersLocked(users)
@@ -81,6 +93,51 @@ func saveUsersLocked(users []UserAccount) error {
 		return err
 	}
 	return os.WriteFile(usersFile, b, 0644)
+}
+
+func getUserPermissions(username string) []string {
+	users := loadUsers()
+	for _, u := range users {
+		if strings.EqualFold(u.Username, username) {
+			if len(u.Permissions) == 0 {
+				return []string{"merge"}
+			}
+			return u.Permissions
+		}
+	}
+	return []string{}
+}
+
+func userHasPermission(username, perm string) bool {
+	if strings.EqualFold(username, "lia") {
+		return true
+	}
+	perms := getUserPermissions(username)
+	for _, p := range perms {
+		if strings.EqualFold(p, perm) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPermissionMiddleware(perm string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isAuthenticated(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Unauthorized"})
+			return
+		}
+		user := getLoggedInUser(r)
+		if !userHasPermission(user, perm) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Anda tidak memiliki hak akses ke fitur ini"})
+			return
+		}
+		next(w, r)
+	}
 }
 
 func validateUserCredentials(username, password string) bool {
@@ -320,14 +377,15 @@ func main() {
 	mux.HandleFunc("/api/login", handleLoginAPI)
 	mux.HandleFunc("/api/logout", handleLogout)
 	mux.HandleFunc("/", authMiddleware(handleIndex))
-	mux.HandleFunc("/api/preview", authAPIMiddleware(handlePreview))
-	mux.HandleFunc("/api/merge", authAPIMiddleware(handleMerge))
+	mux.HandleFunc("/api/preview", hasPermissionMiddleware("merge", handlePreview))
+	mux.HandleFunc("/api/merge", hasPermissionMiddleware("merge", handleMerge))
 
-	// User Management API routes
+	// User Management API routes (require "users" permission)
 	mux.HandleFunc("/api/users", authAPIMiddleware(handleGetUsers))
-	mux.HandleFunc("/api/users/create", authAPIMiddleware(handleCreateUser))
-	mux.HandleFunc("/api/users/update-password", authAPIMiddleware(handleUpdatePassword))
-	mux.HandleFunc("/api/users/delete", authAPIMiddleware(handleDeleteUser))
+	mux.HandleFunc("/api/users/create", hasPermissionMiddleware("users", handleCreateUser))
+	mux.HandleFunc("/api/users/update-password", hasPermissionMiddleware("users", handleUpdatePassword))
+	mux.HandleFunc("/api/users/update-permissions", hasPermissionMiddleware("users", handleUpdatePermissions))
+	mux.HandleFunc("/api/users/delete", hasPermissionMiddleware("users", handleDeleteUser))
 
 	// Find available listener
 	listener, url, err := createListener()
@@ -467,23 +525,31 @@ func handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	users := loadUsers()
 	type UserDTO struct {
-		Username  string `json:"username"`
-		CreatedAt string `json:"createdAt"`
-		IsCurrent bool   `json:"isCurrent"`
+		Username    string   `json:"username"`
+		CreatedAt   string   `json:"createdAt"`
+		IsCurrent   bool     `json:"isCurrent"`
+		Permissions []string `json:"permissions"`
 	}
 	currentUser := getLoggedInUser(r)
+	currentPerms := getUserPermissions(currentUser)
 	var dtos []UserDTO
 	for _, u := range users {
+		perms := u.Permissions
+		if len(perms) == 0 {
+			perms = []string{"merge"}
+		}
 		dtos = append(dtos, UserDTO{
-			Username:  u.Username,
-			CreatedAt: u.CreatedAt,
-			IsCurrent: strings.EqualFold(u.Username, currentUser),
+			Username:    u.Username,
+			CreatedAt:   u.CreatedAt,
+			IsCurrent:   strings.EqualFold(u.Username, currentUser),
+			Permissions: perms,
 		})
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"users":       dtos,
-		"currentUser": currentUser,
+		"success":          true,
+		"users":            dtos,
+		"currentUser":      currentUser,
+		"currentUserPerms": currentPerms,
 	})
 }
 
@@ -495,8 +561,9 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username    string   `json:"username"`
+		Password    string   `json:"password"`
+		Permissions []string `json:"permissions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -509,6 +576,11 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Username dan password tidak boleh kosong"})
 		return
+	}
+
+	perms := req.Permissions
+	if len(perms) == 0 {
+		perms = []string{"merge"}
 	}
 
 	userMutex.Lock()
@@ -524,9 +596,10 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	users = append(users, UserAccount{
-		Username:  username,
-		Password:  hashPassword(password),
-		CreatedAt: time.Now().Format("2006-01-02 15:04"),
+		Username:    username,
+		Password:    hashPassword(password),
+		CreatedAt:   time.Now().Format("2006-01-02 15:04"),
+		Permissions: perms,
 	})
 	if err := saveUsersLocked(users); err != nil {
 		w.WriteHeader(500)
@@ -586,6 +659,67 @@ func handleUpdatePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Password berhasil diperbarui"})
+}
+
+func handleUpdatePermissions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	var req struct {
+		Username    string   `json:"username"`
+		Permissions []string `json:"permissions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Payload tidak valid"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	currentUser := getLoggedInUser(r)
+
+	if strings.EqualFold(username, currentUser) && !sliceContains(req.Permissions, "users") {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Anda tidak dapat mencabut akses Master User dari akun Anda sendiri"})
+		return
+	}
+
+	userMutex.Lock()
+	defer userMutex.Unlock()
+
+	users := loadUsersLocked()
+	found := false
+	for i, u := range users {
+		if strings.EqualFold(u.Username, username) {
+			users[i].Permissions = req.Permissions
+			found = true
+			break
+		}
+	}
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "User tidak ditemukan"})
+		return
+	}
+
+	if err := saveUsersLocked(users); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Gagal mengupdate hak akses"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Hak akses berhasil diperbarui"})
+}
+
+func sliceContains(slice []string, item string) bool {
+	for _, s := range slice {
+		if strings.EqualFold(s, item) {
+			return true
+		}
+	}
+	return false
 }
 
 func handleDeleteUser(w http.ResponseWriter, r *http.Request) {
@@ -2428,9 +2562,22 @@ input[type=file]{display:none}
         <label class="form-label">Username</label>
         <input class="form-input" type="text" id="addUsername" placeholder="Masukkan username" required autocomplete="off">
       </div>
-      <div class="form-group" style="margin-bottom:24px">
+      <div class="form-group">
         <label class="form-label">Password</label>
         <input class="form-input" type="password" id="addPassword" placeholder="Masukkan password" required autocomplete="new-password">
+      </div>
+      <div class="form-group" style="margin-bottom:24px">
+        <label class="form-label">Hak Akses Menu</label>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:6px">
+          <label style="display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="addCheckMerge" value="merge" checked style="width:16px;height:16px;accent-color:var(--accent)">
+            <span>📊 <strong>Merge Data Lembur</strong></span>
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="addCheckUsers" value="users" style="width:16px;height:16px;accent-color:var(--accent)">
+            <span>👥 <strong>Master User</strong></span>
+          </label>
+        </div>
       </div>
       <div style="display:flex;gap:12px;justify-content:flex-end">
         <button type="button" class="btn btn-secondary" onclick="closeModal()">Batal</button>
@@ -2462,7 +2609,39 @@ input[type=file]{display:none}
     </form>
   </div>
 
-  <!-- Modal 3: Confirm Delete -->
+  <!-- Modal 3: Manage Permissions -->
+  <div class="modal-card" id="modalPermissions" style="display:none">
+    <div class="modal-header">
+      <h3>🔐 Kelola Hak Akses User</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <form id="formPermissions" onsubmit="submitUpdatePerms(event)">
+      <input type="hidden" id="permUsername">
+      <div class="form-group">
+        <label class="form-label">User</label>
+        <input class="form-input" style="background:rgba(255,255,255,.05);color:var(--text-muted)" type="text" id="permUsernameDisplay" readonly>
+      </div>
+      <div class="form-group" style="margin-bottom:24px">
+        <label class="form-label">Hak Akses Menu yang Diizinkan</label>
+        <div style="display:flex;flex-direction:column;gap:12px;margin-top:8px">
+          <label style="display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="permCheckMerge" value="merge" style="width:18px;height:18px;accent-color:var(--accent)">
+            <span>📊 <strong>Merge Data Lembur</strong> (Upload &amp; Gabung Excel/PDF)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="permCheckUsers" value="users" style="width:18px;height:18px;accent-color:var(--accent)">
+            <span>👥 <strong>Master User</strong> (Kelola Akun User &amp; Hak Akses)</span>
+          </label>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" onclick="closeModal()">Batal</button>
+        <button type="submit" class="btn btn-primary" id="btnPermSubmit">Simpan Hak Akses</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Modal 4: Confirm Delete -->
   <div class="modal-card" id="modalDelete" style="display:none">
     <div class="modal-header">
       <h3 style="color:#f87171">🗑️ Hapus User</h3>
@@ -2757,18 +2936,30 @@ async function loadUserTable() {
       const username = u.username || u.Username || '';
       const createdAt = u.createdAt || u.CreatedAt || '-';
       const isCurrent = u.isCurrent !== undefined ? u.isCurrent : u.IsCurrent;
+      const perms = u.permissions || u.Permissions || ['merge'];
 
       const tr = document.createElement('tr');
       
       const badge = isCurrent 
         ? '<span style="background:rgba(16,185,129,.15);color:#10b981;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:600">Aktif (Saya)</span>' 
         : '';
-        
+
+      let permChips = '';
+      if (perms.includes('merge')) {
+        permChips += '<span style="background:rgba(236,72,153,.15);color:#f472b6;font-size:11px;padding:2px 8px;border-radius:8px;margin-right:4px">📊 Merge</span>';
+      }
+      if (perms.includes('users')) {
+        permChips += '<span style="background:rgba(99,102,241,.15);color:#818cf8;font-size:11px;padding:2px 8px;border-radius:8px">👥 Master User</span>';
+      }
+
+      const permsJsonAttr = JSON.stringify(perms).replace(/"/g, '&quot;');
+
       tr.innerHTML = 
         '<td><strong>' + escapeHtml(username) + '</strong>' + badge + '</td>' +
         '<td>' + escapeHtml(createdAt) + '</td>' +
-        '<td><span style="color:#10b981">● Active</span></td>' +
+        '<td>' + permChips + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' +
+          '<button class="btn btn-secondary btn-sm" onclick="openPermsModal(\'' + escapeHtml(username) + '\', ' + permsJsonAttr + ')" style="margin-right:6px">🔐 Hak Akses</button>' +
           '<button class="btn btn-secondary btn-sm" onclick="openEditPwModal(\'' + escapeHtml(username) + '\')" style="margin-right:6px">🔑 Ubah Password</button>' +
           (isCurrent 
             ? '<button class="btn btn-secondary btn-sm" disabled style="opacity:.4;cursor:not-allowed">🗑️ Hapus</button>' 
@@ -2785,8 +2976,11 @@ async function loadUserTable() {
 function openAddUserModal() {
   $('addUsername').value = '';
   $('addPassword').value = '';
+  $('addCheckMerge').checked = true;
+  $('addCheckUsers').checked = false;
   $('modalAddUser').style.display = 'block';
   $('modalEditPw').style.display = 'none';
+  $('modalPermissions').style.display = 'none';
   $('modalDelete').style.display = 'none';
   $('modalOverlay').classList.add('visible');
   setTimeout(() => $('addUsername').focus(), 100);
@@ -2798,9 +2992,24 @@ function openEditPwModal(username) {
   $('editNewPassword').value = '';
   $('modalAddUser').style.display = 'none';
   $('modalEditPw').style.display = 'block';
+  $('modalPermissions').style.display = 'none';
   $('modalDelete').style.display = 'none';
   $('modalOverlay').classList.add('visible');
   setTimeout(() => $('editNewPassword').focus(), 100);
+}
+
+function openPermsModal(username, perms) {
+  $('permUsername').value = username;
+  $('permUsernameDisplay').value = username;
+  const pList = Array.isArray(perms) ? perms : [];
+  $('permCheckMerge').checked = pList.includes('merge');
+  $('permCheckUsers').checked = pList.includes('users');
+
+  $('modalAddUser').style.display = 'none';
+  $('modalEditPw').style.display = 'none';
+  $('modalPermissions').style.display = 'block';
+  $('modalDelete').style.display = 'none';
+  $('modalOverlay').classList.add('visible');
 }
 
 function openDeleteModal(username) {
@@ -2808,6 +3017,7 @@ function openDeleteModal(username) {
   $('deleteUsernameDisplay').textContent = username;
   $('modalAddUser').style.display = 'none';
   $('modalEditPw').style.display = 'none';
+  $('modalPermissions').style.display = 'none';
   $('modalDelete').style.display = 'block';
   $('modalOverlay').classList.add('visible');
 }
@@ -2830,12 +3040,21 @@ async function submitAddUser(e) {
     return;
   }
 
+  const permissions = [];
+  if ($('addCheckMerge').checked) permissions.push('merge');
+  if ($('addCheckUsers').checked) permissions.push('users');
+
+  if (permissions.length === 0) {
+    showToast('⚠️', 'Pilih minimal satu hak akses menu', 'error');
+    return;
+  }
+
   $('btnAddUserSubmit').disabled = true;
   try {
     const resp = await fetch('/api/users/create', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({username, password})
+      body: JSON.stringify({username, password, permissions})
     });
     if (resp.status === 401) { window.location.href = '/login'; return; }
     const data = await resp.json();
@@ -2886,6 +3105,41 @@ async function submitEditPw(e) {
   }
 }
 
+async function submitUpdatePerms(e) {
+  e.preventDefault();
+  const username = $('permUsername').value;
+  const permissions = [];
+  if ($('permCheckMerge').checked) permissions.push('merge');
+  if ($('permCheckUsers').checked) permissions.push('users');
+
+  if (permissions.length === 0) {
+    showToast('⚠️', 'Pilih minimal satu hak akses menu', 'error');
+    return;
+  }
+
+  $('btnPermSubmit').disabled = true;
+  try {
+    const resp = await fetch('/api/users/update-permissions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, permissions})
+    });
+    if (resp.status === 401) { window.location.href = '/login'; return; }
+    const data = await resp.json();
+    if (data.success) {
+      showToast('✅', 'Hak akses berhasil diperbarui!', 'success');
+      closeModal();
+      loadUserTable();
+    } else {
+      showToast('❌', data.error || 'Gagal mengupdate hak akses', 'error');
+    }
+  } catch (err) {
+    showToast('❌', err.message, 'error');
+  } finally {
+    $('btnPermSubmit').disabled = false;
+  }
+}
+
 async function submitDeleteUser() {
   const username = $('deleteUsername').value;
   $('btnDeleteSubmit').disabled = true;
@@ -2911,7 +3165,7 @@ async function submitDeleteUser() {
   }
 }
 
-// Initial load for active user badge
+// Initial load for active user badge & tab permissions
 fetch('/api/users')
   .then(r => {
     if (r.status === 401) { window.location.href = '/login'; return null; }
@@ -2920,6 +3174,18 @@ fetch('/api/users')
   .then(data => {
     if (data && data.currentUser) {
       $('currentUsername').textContent = data.currentUser;
+      const perms = data.currentUserPerms || ['merge', 'users'];
+      if (!perms.includes('users')) {
+        $('tabUsers').style.display = 'none';
+      } else {
+        $('tabUsers').style.display = 'inline-flex';
+      }
+      if (!perms.includes('merge')) {
+        $('tabMerge').style.display = 'none';
+        switchTab('users');
+      } else {
+        $('tabMerge').style.display = 'inline-flex';
+      }
     }
   })
   .catch(() => {});
