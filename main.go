@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,9 @@ import (
 
 	"github.com/xuri/excelize/v2"
 )
+
+//go:embed logo.png
+var logoBytes []byte
 
 // Static credentials
 const (
@@ -93,6 +97,7 @@ type PreviewResponse struct {
 func main() {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/logo.png", handleLogo)
 	mux.HandleFunc("/login", handleLogin)
 	mux.HandleFunc("/api/login", handleLoginAPI)
 	mux.HandleFunc("/api/logout", handleLogout)
@@ -262,6 +267,12 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, indexHTML)
+}
+
+func handleLogo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(logoBytes)
 }
 
 func parseUploadedExcels(r *http.Request) ([]*excelize.File, []string, []string, error) {
@@ -864,6 +875,7 @@ const loginHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Login — Asisten Payrol</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -926,14 +938,13 @@ body{
 
 .login-header{text-align:center;margin-bottom:36px}
 .login-logo{
-  width:64px;height:64px;border-radius:18px;
-  background:linear-gradient(135deg,#ec4899,#db2777,#f43f5e);
+  width:84px;height:84px;border-radius:24px;
   display:inline-flex;align-items:center;justify-content:center;
-  font-size:32px;
-  box-shadow:0 8px 32px rgba(236,72,153,.35);
-  margin-bottom:20px;
+  box-shadow:0 8px 32px rgba(236,72,153,.4);
+  margin-bottom:20px;overflow:hidden;
   animation:logoPulse 3s ease-in-out infinite;
 }
+.login-logo img{width:100%;height:100%;object-fit:cover}
 @keyframes logoPulse{
   0%,100%{box-shadow:0 8px 32px rgba(236,72,153,.35)}
   50%{box-shadow:0 8px 48px rgba(236,72,153,.55)}
@@ -1068,7 +1079,7 @@ body{
 <div class="login-wrapper">
   <div class="login-card">
     <div class="login-header">
-      <div class="login-logo">📊</div>
+      <div class="login-logo"><img src="/logo.png" alt="Asisten Payroll Logo"></div>
       <div class="login-title">Asisten Payrol</div>
       <div class="login-subtitle">Silakan login untuk melanjutkan</div>
     </div>
@@ -1182,6 +1193,7 @@ const indexHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asisten Payrol — Penggabung Data Lembur</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -1263,12 +1275,12 @@ body{
   margin-bottom:16px;
 }
 .logo-icon{
-  width:52px;height:52px;border-radius:14px;
-  background:var(--gradient-1);
+  width:64px;height:64px;border-radius:18px;
   display:flex;align-items:center;justify-content:center;
-  font-size:26px;
-  box-shadow:0 4px 20px var(--accent-glow);
+  overflow:hidden;
+  box-shadow:0 6px 24px var(--accent-glow);
 }
+.logo-icon img{width:100%;height:100%;object-fit:cover}
 .logo-text{
   font-size:28px;font-weight:800;
   background:var(--gradient-1);
@@ -1548,7 +1560,7 @@ input[type=file]{display:none}
 <div class="container">
   <header class="header">
     <div class="logo">
-      <div class="logo-icon">📊</div>
+      <div class="logo-icon"><img src="/logo.png" alt="Asisten Payroll Logo"></div>
       <span class="logo-text">Asisten Payrol</span>
     </div>
     <p>Upload file Excel lembur karyawan (multi-sheet),<br>gabungkan jadi satu tabel rapi dalam sekali klik.</p>
