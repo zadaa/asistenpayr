@@ -2,7 +2,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,7 +18,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/xuri/excelize/v2"
@@ -28,8 +28,9 @@ var logoBytes []byte
 
 // Static credentials
 const (
-	authUsername = "lia"
-	authPassword = "422079"
+	authUsername  = "lia"
+	authPassword  = "422079"
+	sessionSecret = "asisten-payrol-hmac-secret-key-2026-v1"
 )
 
 func getClaudeAPIKey() string {
@@ -50,30 +51,44 @@ func getClaudeAPIKey() string {
 	return ""
 }
 
-// Session store
-var (
-	sessions     = make(map[string]time.Time)
-	sessionsLock sync.RWMutex
-)
-
 func generateToken() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	exp := time.Now().Add(7 * 24 * time.Hour).Unix()
+	payload := fmt.Sprintf("%s|%d", authUsername, exp)
+	h := hmac.New(sha256.New, []byte(sessionSecret))
+	h.Write([]byte(payload))
+	sig := hex.EncodeToString(h.Sum(nil))
+	return fmt.Sprintf("%s|%s", payload, sig)
 }
 
 func isAuthenticated(r *http.Request) bool {
 	cookie, err := r.Cookie("session")
-	if err != nil {
+	if err != nil || cookie.Value == "" {
 		return false
 	}
-	sessionsLock.RLock()
-	defer sessionsLock.RUnlock()
-	expiry, ok := sessions[cookie.Value]
-	if !ok || time.Now().After(expiry) {
+
+	parts := strings.Split(cookie.Value, "|")
+	if len(parts) != 3 {
 		return false
 	}
-	return true
+	user := parts[0]
+	expStr := parts[1]
+	sig := parts[2]
+
+	payload := fmt.Sprintf("%s|%s", user, expStr)
+	h := hmac.New(sha256.New, []byte(sessionSecret))
+	h.Write([]byte(payload))
+	expectedSig := hex.EncodeToString(h.Sum(nil))
+
+	if !hmac.Equal([]byte(sig), []byte(expectedSig)) {
+		return false
+	}
+
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return false
+	}
+
+	return user == authUsername
 }
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -251,11 +266,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 		if user == authUsername && pass == authPassword {
 			token := generateToken()
-			expiry := time.Now().Add(24 * time.Hour)
-
-			sessionsLock.Lock()
-			sessions[token] = expiry
-			sessionsLock.Unlock()
+			expiry := time.Now().Add(7 * 24 * time.Hour)
 
 			http.SetCookie(w, &http.Cookie{
 				Name:     "session",
@@ -299,11 +310,7 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := generateToken()
-	expiry := time.Now().Add(24 * time.Hour)
-
-	sessionsLock.Lock()
-	sessions[token] = expiry
-	sessionsLock.Unlock()
+	expiry := time.Now().Add(7 * 24 * time.Hour)
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
@@ -318,12 +325,6 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie("session")
-	if err == nil {
-		sessionsLock.Lock()
-		delete(sessions, cookie.Value)
-		sessionsLock.Unlock()
-	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    "",
