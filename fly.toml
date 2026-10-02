@@ -1,7 +1,7 @@
 # fly.toml app configuration file for Merge Lembur
 # See https://fly.io/docs/reference/configuration/ for options
 
-app = "merge-lembur"
+app = "asistenpayr"
 primary_region = "sin" # Singapore (super fast latency for Indonesia)
 
 [build]
