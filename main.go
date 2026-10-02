@@ -981,8 +981,15 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 		return nil, err
 	}
 
-	models := []string{"gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"}
+	models := []string{
+		"gemini-2.5-flash",
+		"gemini-flash-latest",
+		"gemini-3.5-flash",
+		"gemini-3.1-flash-lite",
+		"gemini-flash-lite-latest",
+	}
 	var lastErr error
+	var isQuotaError bool
 
 	for _, model := range models {
 		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
@@ -1009,10 +1016,15 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 		if resp.StatusCode != http.StatusOK {
 			var gErr GeminiResp
 			_ = json.Unmarshal(respBytes, &gErr)
+			errMsg := string(respBytes)
 			if gErr.Error != nil {
-				lastErr = fmt.Errorf("Gemini API error (%s): %s", model, gErr.Error.Message)
+				errMsg = gErr.Error.Message
+			}
+			if resp.StatusCode == 429 || strings.Contains(strings.ToLower(errMsg), "quota") || strings.Contains(strings.ToLower(errMsg), "exceeded") {
+				isQuotaError = true
+				lastErr = fmt.Errorf("Gemini API Free Tier Limit/Quota tercapai. Silakan coba beberapa saat lagi atau gunakan CLAUDE_API_KEY")
 			} else {
-				lastErr = fmt.Errorf("Gemini API HTTP %d: %s", resp.StatusCode, string(respBytes))
+				lastErr = fmt.Errorf("Gemini API error (%s): %s", model, errMsg)
 			}
 			continue
 		}
@@ -1030,6 +1042,15 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 
 		rawText := gResp.Candidates[0].Content.Parts[0].Text
 		rawText = strings.TrimSpace(rawText)
+
+		if strings.HasPrefix(rawText, "```") {
+			lines := strings.Split(rawText, "\n")
+			if len(lines) > 2 {
+				rawText = strings.Join(lines[1:len(lines)-1], "\n")
+			}
+		}
+		rawText = strings.TrimSpace(rawText)
+
 		if idx := strings.Index(rawText, "["); idx != -1 {
 			if lastIdx := strings.LastIndex(rawText, "]"); lastIdx != -1 && lastIdx > idx {
 				rawText = rawText[idx : lastIdx+1]
@@ -1038,31 +1059,78 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 
 		var rows []ExtractedRow
 		if err := json.Unmarshal([]byte(rawText), &rows); err != nil {
-			lastErr = fmt.Errorf("Gagal parsing JSON output dari Gemini AI (%s): %v", model, err)
-			continue
+			var singleRow ExtractedRow
+			if errSingle := json.Unmarshal([]byte(rawText), &singleRow); errSingle == nil && singleRow.EmpName != "" {
+				rows = []ExtractedRow{singleRow}
+			} else {
+				var wrapper map[string]json.RawMessage
+				if errWrap := json.Unmarshal([]byte(rawText), &wrapper); errWrap == nil {
+					for _, v := range wrapper {
+						var subRows []ExtractedRow
+						if errSub := json.Unmarshal(v, &subRows); errSub == nil && len(subRows) > 0 {
+							rows = subRows
+							break
+						}
+					}
+				}
+			}
+			if len(rows) == 0 {
+				lastErr = fmt.Errorf("Gagal parsing JSON output dari Gemini AI (%s): %v", model, err)
+				continue
+			}
 		}
 
 		return rows, nil
+	}
+
+	if isQuotaError {
+		return nil, fmt.Errorf("Gemini API Free Tier Request Limit/Quota tercapai. Mohon tunggu beberapa saat atau gunakan CLAUDE_API_KEY")
 	}
 
 	return nil, fmt.Errorf("Gagal memproses PDF dengan Gemini AI: %v", lastErr)
 }
 
 func parsePDFWithAI(pdfBytes []byte) ([]ExtractedRow, error) {
+	var geminiErr error
 	geminiKey := getGeminiAPIKey()
 	if geminiKey != "" {
-		return parsePDFWithGemini(pdfBytes, geminiKey)
+		rows, err := parsePDFWithGemini(pdfBytes, geminiKey)
+		if err == nil && len(rows) > 0 {
+			return rows, nil
+		}
+		geminiErr = err
 	}
 
 	claudeKey := getClaudeAPIKey()
 	if claudeKey != "" {
 		if strings.HasPrefix(claudeKey, "sk-ant-api03-") || strings.HasPrefix(claudeKey, "sk-ant-svc-") {
-			return parsePDFWithClaude(pdfBytes, claudeKey)
+			rows, err := parsePDFWithClaude(pdfBytes, claudeKey)
+			if err == nil && len(rows) > 0 {
+				return rows, nil
+			}
+			if geminiErr != nil {
+				return nil, fmt.Errorf("Gagal Gemini (%v) & Gagal Claude (%v)", geminiErr, err)
+			}
+			return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", err)
 		}
 		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
-			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai, bukan API Developer Console. Mohon gunakan API Key resmi dari Service Account https://console.anthropic.com (diawali 'sk-ant-svc-' atau 'sk-ant-api03-') atau atur GEMINI_API_KEY gratis dari https://aistudio.google.com/app/apikey")
+			if geminiErr != nil {
+				return nil, fmt.Errorf("%v (Catatan: CLAUDE_API_KEY yang ada adalah token web sk-ant-usr-, mohon gunakan API Key resmi sk-ant-api03- dari https://console.anthropic.com)", geminiErr)
+			}
+			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai. Mohon gunakan API Key resmi dari https://console.anthropic.com atau atur GEMINI_API_KEY dari https://aistudio.google.com/app/apikey")
 		}
-		return parsePDFWithClaude(pdfBytes, claudeKey)
+		rows, err := parsePDFWithClaude(pdfBytes, claudeKey)
+		if err == nil && len(rows) > 0 {
+			return rows, nil
+		}
+		if geminiErr != nil {
+			return nil, fmt.Errorf("%v (Fallback Claude error: %v)", geminiErr, err)
+		}
+		return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", err)
+	}
+
+	if geminiErr != nil {
+		return nil, geminiErr
 	}
 
 	return nil, fmt.Errorf("API Key AI belum dikonfigurasi. Silakan atur GEMINI_API_KEY (Gratis di https://aistudio.google.com/app/apikey) atau CLAUDE_API_KEY (di https://console.anthropic.com)")
