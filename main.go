@@ -2500,13 +2500,13 @@ input[type=file]{display:none}
         <div class="drop-icon">📁</div>
         <div class="drop-title">Drag &amp; drop file Excel (.xlsx) atau PDF di sini</div>
         <div class="drop-subtitle">atau klik tombol di bawah untuk memilih file (.xlsx, .pdf) &bull; dukung baca formulir PDF tulisan tangan dengan AI</div>
-        <button class="drop-btn" id="browseBtn">
+        <button type="button" class="drop-btn" id="browseBtn">
           <span>📎</span> Pilih File Excel / PDF (Multiple)
         </button>
         <input type="file" id="fileInput" accept=".xlsx,.xls,.pdf" multiple>
-
-        <div class="file-list" id="fileList"></div>
       </div>
+
+      <div class="file-list" id="fileList"></div>
     </div>
 
     <div class="stats-bar" id="statsBar">
@@ -2826,12 +2826,25 @@ function renderFileList() {
     item.className = 'file-item';
     const isPDF = file.name.match(/\.pdf$/i);
     const icon = isPDF ? '📄' : '📊';
+    
     item.innerHTML = '<span class="file-item-icon">' + icon + '</span>' +
       '<div class="file-item-details">' +
         '<div class="file-item-name">' + escapeHtml(file.name) + (isPDF ? ' <span style="font-size:10px;background:#ec4899;color:#fff;padding:1px 6px;border-radius:6px;margin-left:4px">PDF AI</span>' : '') + '</div>' +
         '<div class="file-item-size">' + formatBytes(file.size) + '</div>' +
-      '</div>' +
-      '<button type="button" class="file-item-remove" title="Hapus file" onclick="event.stopPropagation(); event.preventDefault(); removeFile(' + idx + ')">✕</button>';
+      '</div>';
+    
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'file-item-remove';
+    removeBtn.title = 'Hapus file';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      removeFile(idx);
+    });
+
+    item.appendChild(removeBtn);
     fileList.appendChild(item);
   });
   fileList.classList.add('visible');
