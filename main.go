@@ -821,9 +821,9 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILARANG menyertakan teks pembuka, penutup, atau formatting markdown.`
 
 	models := []string{
+		"claude-3-5-haiku-20241022",
 		"claude-3-5-sonnet-20241022",
 		"claude-3-7-sonnet-20250219",
-		"claude-3-5-haiku-20241022",
 		"claude-3-haiku-20240307",
 	}
 
@@ -929,7 +929,7 @@ PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILA
 
 	errMsg := fmt.Sprintf("%v", lastErr)
 	if strings.Contains(errMsg, "authentication_error") || strings.Contains(errMsg, "not_found_error") || strings.Contains(errMsg, "invalid") || strings.HasPrefix(apiKey, "sk-ant-usr-") {
-		return nil, fmt.Errorf("API Key Claude tidak memiliki akses API Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (yang diawali dengan 'sk-ant-api03-')")
+		return nil, fmt.Errorf("API Key Claude tidak memiliki akses API Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (yang diawali dengan 'sk-ant-api03-' atau 'sk-ant-svc-')")
 	}
 
 	return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", lastErr)
@@ -1091,49 +1091,37 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 }
 
 func parsePDFWithAI(pdfBytes []byte) ([]ExtractedRow, error) {
-	var geminiErr error
+	var claudeErr error
+	claudeKey := getClaudeAPIKey()
+	if claudeKey != "" {
+		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
+			claudeErr = fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai, bukan API Developer Console. Mohon gunakan API Key resmi dari https://console.anthropic.com (diawali 'sk-ant-api03-' atau 'sk-ant-svc-')")
+		} else {
+			rows, err := parsePDFWithClaude(pdfBytes, claudeKey)
+			if err == nil && len(rows) > 0 {
+				return rows, nil
+			}
+			claudeErr = err
+		}
+	}
+
 	geminiKey := getGeminiAPIKey()
 	if geminiKey != "" {
 		rows, err := parsePDFWithGemini(pdfBytes, geminiKey)
 		if err == nil && len(rows) > 0 {
 			return rows, nil
 		}
-		geminiErr = err
+		if claudeErr != nil {
+			return nil, fmt.Errorf("Claude gagal (%v), Gemini juga gagal (%v)", claudeErr, err)
+		}
+		return nil, fmt.Errorf("Gagal memproses PDF dengan Gemini AI: %v", err)
 	}
 
-	claudeKey := getClaudeAPIKey()
-	if claudeKey != "" {
-		if strings.HasPrefix(claudeKey, "sk-ant-api03-") || strings.HasPrefix(claudeKey, "sk-ant-svc-") {
-			rows, err := parsePDFWithClaude(pdfBytes, claudeKey)
-			if err == nil && len(rows) > 0 {
-				return rows, nil
-			}
-			if geminiErr != nil {
-				return nil, fmt.Errorf("Gagal Gemini (%v) & Gagal Claude (%v)", geminiErr, err)
-			}
-			return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", err)
-		}
-		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
-			if geminiErr != nil {
-				return nil, fmt.Errorf("%v (Catatan: CLAUDE_API_KEY yang ada adalah token web sk-ant-usr-, mohon gunakan API Key resmi sk-ant-api03- dari https://console.anthropic.com)", geminiErr)
-			}
-			return nil, fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai. Mohon gunakan API Key resmi dari https://console.anthropic.com atau atur GEMINI_API_KEY dari https://aistudio.google.com/app/apikey")
-		}
-		rows, err := parsePDFWithClaude(pdfBytes, claudeKey)
-		if err == nil && len(rows) > 0 {
-			return rows, nil
-		}
-		if geminiErr != nil {
-			return nil, fmt.Errorf("%v (Fallback Claude error: %v)", geminiErr, err)
-		}
-		return nil, fmt.Errorf("Gagal memproses PDF dengan Claude AI: %v", err)
+	if claudeErr != nil {
+		return nil, claudeErr
 	}
 
-	if geminiErr != nil {
-		return nil, geminiErr
-	}
-
-	return nil, fmt.Errorf("API Key AI belum dikonfigurasi. Silakan atur GEMINI_API_KEY (Gratis di https://aistudio.google.com/app/apikey) atau CLAUDE_API_KEY (di https://console.anthropic.com)")
+	return nil, fmt.Errorf("API Key AI belum dikonfigurasi. Silakan atur CLAUDE_API_KEY (di https://console.anthropic.com) atau GEMINI_API_KEY (di https://aistudio.google.com/app/apikey)")
 }
 
 type ProcessedResult struct {
