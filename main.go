@@ -835,7 +835,7 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 - "ot_morning_finish": Jam Selesai Lembur Pagi (contoh: 08:00, jika tidak ada isi "")
 - "ot_night_start": Jam Mulai Lembur Malam (contoh: 17:00, jika tidak ada isi "")
 - "ot_night_finish": Jam Selesai Lembur Malam (contoh: 21:00, jika tidak ada isi "")
-- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4, jika tidak ada isi "")
+- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4). PENTING: Jika di kolom total lembur pada formulir PDF kosong, HITUNG OTOMATIS dari selisih waktu: (Jam Selesai Pagi - Jam Mulai Pagi) + (Jam Selesai Malam - Jam Mulai Malam). Jangan pernah biarkan total_ot kosong jika jam mulai dan jam selesai ada!
 
 PENTING: Kembalikan HANYA JSON array murni saja (diawali [ dan diakhiri ]). DILARANG menyertakan teks pembuka, penutup, atau formatting markdown.`
 
@@ -972,7 +972,7 @@ Setiap objek dalam array JSON harus berisi kunci-kunci berikut:
 - "ot_morning_finish": Jam Selesai Lembur Pagi (contoh: 08:00, jika tidak ada isi "")
 - "ot_night_start": Jam Mulai Lembur Malam (contoh: 17:00, jika tidak ada isi "")
 - "ot_night_finish": Jam Selesai Lembur Malam (contoh: 21:00, jika tidak ada isi "")
-- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4, jika tidak ada isi "")`
+- "total_ot": Total Jam Lembur (contoh: 4.0 atau 4). PENTING: Jika di kolom total lembur pada formulir PDF kosong, HITUNG OTOMATIS dari selisih waktu: (Jam Selesai Pagi - Jam Mulai Pagi) + (Jam Selesai Malam - Jam Mulai Malam). Jangan pernah biarkan total_ot kosong jika jam mulai dan jam selesai ada!`
 
 	reqBody := GeminiReq{
 		Contents: []GeminiContent{
@@ -1216,6 +1216,8 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 					dateVal = t.Format("2006-01-02")
 				}
 
+				totalOT := calculateTotalOT(pr.OTMorningStart, pr.OTMorningFinish, pr.OTNightStart, pr.OTNightFinish, pr.TotalOT)
+
 				outRow := []string{
 					emp,
 					pr.NIK,
@@ -1229,7 +1231,7 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 					pr.OTMorningFinish,
 					pr.OTNightStart,
 					pr.OTNightFinish,
-					pr.TotalOT,
+					totalOT,
 				}
 				result.Rows = append(result.Rows, outRow)
 				dataCount++
@@ -1325,6 +1327,13 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 						dateVal = t.Format("2006-01-02")
 					}
 
+					mStart := getCell(row, 3)
+					mFinish := getCell(row, 4)
+					nStart := getCell(row, 5)
+					nFinish := getCell(row, 6)
+					rawTotalOT := getCell(row, 7)
+					totalOT := calculateTotalOT(mStart, mFinish, nStart, nFinish, rawTotalOT)
+
 					outRow := []string{
 						empName,
 						nik,
@@ -1334,11 +1343,11 @@ func processUploadedFiles(r *http.Request) (*ProcessedResult, error) {
 						dateVal,
 						getCell(row, 1),
 						getCell(row, 2),
-						getCell(row, 3),
-						getCell(row, 4),
-						getCell(row, 5),
-						getCell(row, 6),
-						getCell(row, 7),
+						mStart,
+						mFinish,
+						nStart,
+						nFinish,
+						totalOT,
 					}
 					result.Rows = append(result.Rows, outRow)
 					dataCount++
@@ -1456,6 +1465,82 @@ func parseDateString(s string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// parseTimeToMinutes parses a time string (e.g. "06:00", "06.00", "6", "17:30") into minutes from midnight.
+func parseTimeToMinutes(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "-" {
+		return 0, false
+	}
+	s = strings.ReplaceAll(s, ".", ":")
+	s = strings.ReplaceAll(s, ";", ":")
+
+	if strings.Contains(s, ":") {
+		parts := strings.Split(s, ":")
+		if len(parts) >= 2 {
+			h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+			m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err1 == nil && err2 == nil && h >= 0 && h <= 24 && m >= 0 && m < 60 {
+				return h*60 + m, true
+			}
+		}
+	}
+
+	if val, err := strconv.Atoi(s); err == nil && val >= 0 && val <= 24 {
+		return val * 60, true
+	}
+
+	if val, err := strconv.ParseFloat(strings.ReplaceAll(s, ",", "."), 64); err == nil && val >= 0 && val <= 24 {
+		return int(val * 60), true
+	}
+
+	return 0, false
+}
+
+// calculateDurationHours calculates overtime duration in hours between start and finish.
+func calculateDurationHours(startStr, finishStr string) float64 {
+	startMin, ok1 := parseTimeToMinutes(startStr)
+	finishMin, ok2 := parseTimeToMinutes(finishStr)
+	if !ok1 || !ok2 {
+		return 0
+	}
+	diff := finishMin - startMin
+	if diff < 0 {
+		diff += 24 * 60 // Handle crossing midnight (e.g. 22:00 to 02:00)
+	}
+	if diff <= 0 {
+		return 0
+	}
+	return float64(diff) / 60.0
+}
+
+// calculateTotalOT returns existing total if present and > 0, otherwise calculates from morning + night shifts.
+func calculateTotalOT(morningStart, morningFinish, nightStart, nightFinish, existingTotal string) string {
+	existingTotal = strings.TrimSpace(existingTotal)
+	cleanTotal := strings.ReplaceAll(existingTotal, ",", ".")
+	cleanTotal = strings.TrimSuffix(cleanTotal, " jam")
+	cleanTotal = strings.TrimSuffix(cleanTotal, "jam")
+	cleanTotal = strings.TrimSpace(cleanTotal)
+
+	if cleanTotal != "" && cleanTotal != "-" {
+		if val, err := strconv.ParseFloat(cleanTotal, 64); err == nil && val > 0 {
+			return strconv.FormatFloat(val, 'f', -1, 64)
+		}
+	}
+
+	durMorning := calculateDurationHours(morningStart, morningFinish)
+	durNight := calculateDurationHours(nightStart, nightFinish)
+	total := durMorning + durNight
+
+	if total > 0 {
+		return strconv.FormatFloat(total, 'f', -1, 64)
+	}
+
+	if existingTotal != "" {
+		return existingTotal
+	}
+	return ""
 }
 
 func findHeaderRow(rows [][]string) int {
@@ -1580,6 +1665,12 @@ func generateMergedExcelFile(res *ProcessedResult) (string, error) {
 			if colIdx == 5 { // Date column
 				if t, ok := parseDateString(val); ok {
 					out.SetCellValue(outSheet, cell, t)
+				} else {
+					out.SetCellValue(outSheet, cell, val)
+				}
+			} else if colIdx == 12 { // Total Overtime column
+				if num, err := strconv.ParseFloat(strings.ReplaceAll(val, ",", "."), 64); err == nil && num > 0 {
+					out.SetCellValue(outSheet, cell, num)
 				} else {
 					out.SetCellValue(outSheet, cell, val)
 				}
