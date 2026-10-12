@@ -1,10 +1,8 @@
-# fly.toml app configuration file generated for asistenpayr on 2026-10-02T04:31:58Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# fly.toml app configuration file generated for asistenpayr
 #
 
 app = "asistenpayr"
-primary_region = "sin" # Singapore (super fast latency for Indonesia)
+primary_region = "nrt"
 
 [build]
   dockerfile = 'Dockerfile'
@@ -19,8 +17,12 @@ primary_region = "sin" # Singapore (super fast latency for Indonesia)
   auto_start_machines = true
   min_machines_running = 1
 
+[mounts]
+  source = "data"
+  destination = "/data"
+
 [[vm]]
-  memory = '256mb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
+  memory_mb = 512

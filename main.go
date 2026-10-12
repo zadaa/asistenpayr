@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -41,8 +42,24 @@ type UserAccount struct {
 
 var (
 	userMutex sync.RWMutex
-	usersFile = "users.json"
 )
+
+func getUsersFilePath() string {
+	if dataDir := os.Getenv("DATA_DIR"); dataDir != "" {
+		_ = os.MkdirAll(dataDir, 0755)
+		return filepath.Join(dataDir, "users.json")
+	}
+	if _, err := os.Stat("/data"); err == nil {
+		p := filepath.Join("/data", "users.json")
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			if localB, err := os.ReadFile("users.json"); err == nil {
+				_ = os.WriteFile(p, localB, 0644)
+			}
+		}
+		return p
+	}
+	return "users.json"
+}
 
 func hashPassword(pass string) string {
 	h := sha256.New()
@@ -52,7 +69,7 @@ func hashPassword(pass string) string {
 
 func loadUsersLocked() []UserAccount {
 	var users []UserAccount
-	b, err := os.ReadFile(usersFile)
+	b, err := os.ReadFile(getUsersFilePath())
 	if err == nil {
 		_ = json.Unmarshal(b, &users)
 	}
@@ -92,7 +109,7 @@ func saveUsersLocked(users []UserAccount) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(usersFile, b, 0644)
+	return os.WriteFile(getUsersFilePath(), b, 0644)
 }
 
 func getUserPermissions(username string) []string {
@@ -272,6 +289,7 @@ type PreviewResponse struct {
 	Success    bool       `json:"success"`
 	Message    string     `json:"message,omitempty"`
 	Error      string     `json:"error,omitempty"`
+	DownloadId string     `json:"downloadId,omitempty"`
 	TotalFiles int        `json:"totalFiles,omitempty"`
 	Sheets     []string   `json:"sheets,omitempty"`
 	Headers    []string   `json:"headers,omitempty"`
@@ -378,6 +396,7 @@ func main() {
 	mux.HandleFunc("/api/logout", handleLogout)
 	mux.HandleFunc("/", authMiddleware(handleIndex))
 	mux.HandleFunc("/api/preview", hasPermissionMiddleware("merge", handlePreview))
+	mux.HandleFunc("/api/download", hasPermissionMiddleware("merge", handleDownloadFast))
 	mux.HandleFunc("/api/merge", hasPermissionMiddleware("merge", handleMerge))
 
 	// User Management API routes (require "users" permission)
@@ -1473,51 +1492,17 @@ func isEmptyDataRow(row []string) bool {
 	return false
 }
 
-func handlePreview(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "POST" {
-		json.NewEncoder(w).Encode(PreviewResponse{Error: "Method not allowed"})
-		return
-	}
-
-	res, err := processUploadedFiles(r)
-	if err != nil {
-		json.NewEncoder(w).Encode(PreviewResponse{Error: err.Error()})
-		return
-	}
-
-	resp := PreviewResponse{
-		Success:    true,
-		TotalFiles: res.TotalFiles,
-		Sheets:     res.SheetNames,
-		Headers:    res.Headers,
-		TotalRows:  len(res.Rows),
-		SheetStats: res.SheetStats,
-	}
-
-	previewLimit := 200
-	if len(res.Rows) <= previewLimit {
-		resp.Rows = res.Rows
-	} else {
-		resp.Rows = res.Rows[:previewLimit]
-	}
-
-	json.NewEncoder(w).Encode(resp)
+type DownloadCacheItem struct {
+	FilePath  string
+	CreatedAt time.Time
 }
 
-func handleMerge(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
-		return
-	}
+var (
+	downloadCacheMutex sync.RWMutex
+	downloadCache      = make(map[string]DownloadCacheItem)
+)
 
-	res, err := processUploadedFiles(r)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-
+func generateMergedExcelFile(res *ProcessedResult) (string, error) {
 	out := excelize.NewFile()
 	outSheet := "Data Lembur Gabungan"
 	idx, _ := out.NewSheet(outSheet)
@@ -1658,17 +1643,118 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 
 	tmpOut, err := os.CreateTemp("", "merged-*.xlsx")
 	if err != nil {
-		http.Error(w, "Gagal membuat file output", 500)
-		return
+		return "", err
 	}
 	tmpOutPath := tmpOut.Name()
 	tmpOut.Close()
-	defer os.Remove(tmpOutPath)
 
 	if err := out.SaveAs(tmpOutPath); err != nil {
-		http.Error(w, "Gagal menyimpan file output", 500)
+		_ = os.Remove(tmpOutPath)
+		return "", err
+	}
+
+	return tmpOutPath, nil
+}
+
+func handlePreview(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		json.NewEncoder(w).Encode(PreviewResponse{Error: "Method not allowed"})
 		return
 	}
+
+	res, err := processUploadedFiles(r)
+	if err != nil {
+		json.NewEncoder(w).Encode(PreviewResponse{Error: err.Error()})
+		return
+	}
+
+	resp := PreviewResponse{
+		Success:    true,
+		TotalFiles: res.TotalFiles,
+		Sheets:     res.SheetNames,
+		Headers:    res.Headers,
+		TotalRows:  len(res.Rows),
+		SheetStats: res.SheetStats,
+	}
+
+	// Pre-generate the Excel file for fast instant download without calling AI again
+	if tmpPath, err := generateMergedExcelFile(res); err == nil {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", tmpPath, time.Now().UnixNano())))
+		downloadId := hex.EncodeToString(h[:16])
+
+		downloadCacheMutex.Lock()
+		downloadCache[downloadId] = DownloadCacheItem{
+			FilePath:  tmpPath,
+			CreatedAt: time.Now(),
+		}
+		// Clean cached files older than 2 hours
+		now := time.Now()
+		for id, item := range downloadCache {
+			if now.Sub(item.CreatedAt) > 2*time.Hour {
+				_ = os.Remove(item.FilePath)
+				delete(downloadCache, id)
+			}
+		}
+		downloadCacheMutex.Unlock()
+
+		resp.DownloadId = downloadId
+	}
+
+	previewLimit := 200
+	if len(res.Rows) <= previewLimit {
+		resp.Rows = res.Rows
+	} else {
+		resp.Rows = res.Rows[:previewLimit]
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleDownloadFast(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "ID download tidak valid", 400)
+		return
+	}
+
+	downloadCacheMutex.RLock()
+	item, ok := downloadCache[id]
+	downloadCacheMutex.RUnlock()
+
+	if !ok || item.FilePath == "" {
+		http.Error(w, "File download telah kedaluwarsa. Silakan upload ulang.", 404)
+		return
+	}
+
+	if _, err := os.Stat(item.FilePath); os.IsNotExist(err) {
+		http.Error(w, "File download tidak ditemukan di server", 404)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", "attachment; filename=hasil_gabungan_lembur.xlsx")
+	http.ServeFile(w, r, item.FilePath)
+}
+
+func handleMerge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	res, err := processUploadedFiles(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	tmpOutPath, err := generateMergedExcelFile(res)
+	if err != nil {
+		http.Error(w, "Gagal membuat file output: "+err.Error(), 500)
+		return
+	}
+	defer os.Remove(tmpOutPath)
 
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", "attachment; filename=hasil_gabungan_lembur.xlsx")
@@ -2735,6 +2821,7 @@ const resetBtn = $('resetBtn');
 
 let selectedFiles = [];
 let activeTab = 'merge';
+let currentDownloadId = '';
 
 function switchTab(tab) {
   activeTab = tab;
@@ -2805,6 +2892,7 @@ function addFiles(files) {
 function removeFile(index) {
   selectedFiles.splice(index, 1);
   fileInput.value = '';
+  currentDownloadId = '';
   renderFileList();
   if (selectedFiles.length > 0) {
     previewFiles();
@@ -2927,6 +3015,9 @@ async function previewFiles() {
     }
 
     actions.classList.add('visible');
+    if (data.downloadId) {
+      currentDownloadId = data.downloadId;
+    }
     showToast('✅', selectedFiles.length + ' file berhasil diproses! Siap untuk download.', 'success');
   } catch (err) {
     spinner.classList.remove('visible');
@@ -2940,12 +3031,32 @@ downloadBtn.addEventListener('click', async () => {
   downloadBtn.innerHTML = '<span class="spinner-ring" style="width:18px;height:18px;border-width:2px;display:inline-block"></span> Mengunduh...';
   downloadBtn.disabled = true;
 
-  const form = new FormData();
-  selectedFiles.forEach(f => {
-    form.append('files', f);
-  });
-
   try {
+    if (currentDownloadId) {
+      // Instant download: stream pre-generated file directly without running AI twice
+      const resp = await fetch('/api/download?id=' + encodeURIComponent(currentDownloadId));
+      if (!resp.ok) {
+        throw new Error('Gagal mengunduh file (' + resp.status + ')');
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'hasil_gabungan_lembur.xlsx';
+      a.click();
+      URL.revokeObjectURL(url);
+
+      showToast('🎉', 'File berhasil diunduh secara instan!', 'success');
+      return;
+    }
+
+    // Fallback: full processing if no cached downloadId
+    const form = new FormData();
+    selectedFiles.forEach(f => {
+      form.append('files', f);
+    });
+
     const resp = await fetch('/api/merge', { method: 'POST', body: form });
     if (!resp.ok) throw new Error('Gagal generate file');
 
@@ -2969,6 +3080,7 @@ downloadBtn.addEventListener('click', async () => {
 function resetAll() {
   selectedFiles = [];
   fileInput.value = '';
+  currentDownloadId = '';
   renderFileList();
   statsBar.classList.remove('visible');
   sheetList.classList.remove('visible');
