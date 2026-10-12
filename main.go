@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -37,7 +38,31 @@ type UserAccount struct {
 	Username    string   `json:"username"`
 	Password    string   `json:"password"` // SHA256 hashed
 	CreatedAt   string   `json:"createdAt"`
-	Permissions []string `json:"permissions"` // e.g. ["merge", "users"]
+	Permissions []string `json:"permissions"` // e.g. ["merge", "reimburse", "users"]
+}
+
+type ReimburseReceipt struct {
+	ReceiptNo   int     `json:"receipt_no"`
+	Merchant    string  `json:"merchant"`
+	Date        string  `json:"date"`
+	Amount      float64 `json:"amount"`
+	PageNumber  int     `json:"page_number"`
+	Description string  `json:"description"`
+	IsLegible   bool    `json:"is_legible"`
+}
+
+type ReimburseCheckResult struct {
+	EmployeeName  string             `json:"employee_name"`
+	Department    string             `json:"department"`
+	RecapDate     string             `json:"recap_date"`
+	RecapNumber   string             `json:"recap_number"`
+	RecapTotal    float64            `json:"recap_total"`
+	PhysicalTotal float64            `json:"physical_total"`
+	Difference    float64            `json:"difference"`
+	Status        string             `json:"status"` // "MATCH", "OVERCLAIM", "UNDERCLAIM", "WARNING"
+	StatusMessage string             `json:"status_message"`
+	Receipts      []ReimburseReceipt `json:"receipts"`
+	DownloadId    string             `json:"download_id,omitempty"`
 }
 
 var (
@@ -77,9 +102,20 @@ func loadUsersLocked() []UserAccount {
 	for i := range users {
 		if len(users[i].Permissions) == 0 {
 			if strings.EqualFold(users[i].Username, "lia") {
-				users[i].Permissions = []string{"merge", "users"}
+				users[i].Permissions = []string{"merge", "reimburse", "users"}
 			} else {
 				users[i].Permissions = []string{"merge"}
+			}
+		} else if strings.EqualFold(users[i].Username, "lia") {
+			// Ensure admin lia always has all permissions
+			if !sliceContains(users[i].Permissions, "reimburse") {
+				users[i].Permissions = append(users[i].Permissions, "reimburse")
+			}
+			if !sliceContains(users[i].Permissions, "merge") {
+				users[i].Permissions = append(users[i].Permissions, "merge")
+			}
+			if !sliceContains(users[i].Permissions, "users") {
+				users[i].Permissions = append(users[i].Permissions, "users")
 			}
 		}
 	}
@@ -90,7 +126,7 @@ func loadUsersLocked() []UserAccount {
 				Username:    "lia",
 				Password:    hashPassword("422079"),
 				CreatedAt:   time.Now().Format("2006-01-02 15:04"),
-				Permissions: []string{"merge", "users"},
+				Permissions: []string{"merge", "reimburse", "users"},
 			},
 		}
 		_ = saveUsersLocked(users)
@@ -398,6 +434,10 @@ func main() {
 	mux.HandleFunc("/api/preview", hasPermissionMiddleware("merge", handlePreview))
 	mux.HandleFunc("/api/download", hasPermissionMiddleware("merge", handleDownloadFast))
 	mux.HandleFunc("/api/merge", hasPermissionMiddleware("merge", handleMerge))
+
+	// Reimburse Checker API routes (require "reimburse" permission)
+	mux.HandleFunc("/api/reimburse/check", hasPermissionMiddleware("reimburse", handleReimburseCheck))
+	mux.HandleFunc("/api/reimburse/download", hasPermissionMiddleware("reimburse", handleReimburseDownload))
 
 	// User Management API routes (require "users" permission)
 	mux.HandleFunc("/api/users", authAPIMiddleware(handleGetUsers))
@@ -1852,6 +1892,792 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, tmpOutPath)
 }
 
+func parseReimburseWithClaude(pdfBytes []byte, apiKey string) (*ReimburseCheckResult, error) {
+	if apiKey == "" {
+		apiKey = getClaudeAPIKey()
+	}
+	base64PDF := base64.StdEncoding.EncodeToString(pdfBytes)
+
+	prompt := `Anda adalah AI auditor keuangan dan pemeriksa dokumen klaim reimburse / expense claim.
+Dokumen PDF ini berisi formulir rekapitulasi klaim reimbursement (biasanya di Halaman 1 atau awal dokumen) dan halaman-halaman berikutnya berisi lampiran kwitansi / struk / nota / bukti transfer fisik yang ditempel (bisa satu atau beberapa nota per halaman).
+
+Tugas Anda:
+1. Baca formulir rekap klaim (halaman awal):
+   - "employee_name": Nama karyawan yang mengajukan klaim
+   - "department": Divisi / Departemen (jika ada, kosongkan "" jika tidak ada)
+   - "recap_date": Tanggal formulir pengajuan
+   - "recap_number": Nomor form / nomor klaim / no reimburse (jika ada)
+   - "recap_total": Total nominal uang yang diajukan pada formulir rekap (angka float murni tanpa simbol mata uang atau titik ribuan, contoh: 350000).
+
+2. Cari dan deteksi SEMUA bukti/kwitansi/struk/nota/tiket fisik yang ada pada halaman lampiran (halaman 2 ke atas, atau struk yang tertempel):
+   Untuk SETIAP kwitansi yang ditemukan, masukkan ke array "receipts":
+   - "receipt_no": nomor urut struk (1, 2, 3...)
+   - "merchant": Nama toko / restoran / merchant / vendor (contoh: "Indomaret", "Pertamina", "Grab", dll)
+   - "date": Tanggal transaksi pada struk (format YYYY-MM-DD atau sesuai tertera)
+   - "amount": Nominal total pembayaran pada kwitansi tersebut (angka float murni, contoh: 45000).
+   - "page_number": Nomor halaman PDF di mana kwitansi ini berada (1, 2, 3, dst)
+   - "description": Jenis pengeluaran / item belanja / keperluan (contoh: "BBM Pertamax", "Konsumsi Rapat", "Parkir")
+   - "is_legible": true jika nominal dan nota terbaca jelas, false jika buram / terpotong
+
+Format output: KEMBALIKAN HANYA SATU JSON OBJECT MURNI (dimulai dengan { dan diakhiri dengan }):
+{
+  "employee_name": "...",
+  "department": "...",
+  "recap_date": "...",
+  "recap_number": "...",
+  "recap_total": 0,
+  "receipts": [
+    {
+      "receipt_no": 1,
+      "merchant": "...",
+      "date": "...",
+      "amount": 0,
+      "page_number": 2,
+      "description": "...",
+      "is_legible": true
+    }
+  ]
+}
+
+PENTING: Jangan sertakan format markdown backticks, teks pembuka, ataupun penutup. Hanya JSON murni.`
+
+	models := []string{
+		"claude-3-5-haiku-20241022",
+		"claude-3-5-sonnet-20241022",
+		"claude-3-7-sonnet-20250219",
+		"claude-3-haiku-20240307",
+	}
+
+	var lastErr error
+	for _, model := range models {
+		reqBody := ClaudeReq{
+			Model:     model,
+			MaxTokens: 4096,
+			Messages: []ClaudeMessage{
+				{
+					Role: "user",
+					Content: []ClaudeContentItem{
+						{
+							Type: "document",
+							Source: &ClaudeDocSource{
+								Type:      "base64",
+								MediaType: "application/pdf",
+								Data:      base64PDF,
+							},
+						},
+						{
+							Type: "text",
+							Text: prompt,
+						},
+					},
+				},
+			},
+		}
+
+		jsonBytes, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(jsonBytes))
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
+
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			var cErr ClaudeResp
+			_ = json.Unmarshal(respBytes, &cErr)
+			if cErr.Error != nil {
+				lastErr = fmt.Errorf("Claude API error (%s): %s", model, cErr.Error.Message)
+			} else {
+				lastErr = fmt.Errorf("Claude API HTTP %d: %s", resp.StatusCode, string(respBytes))
+			}
+			continue
+		}
+
+		var cResp ClaudeResp
+		if err := json.Unmarshal(respBytes, &cResp); err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(cResp.Content) == 0 {
+			lastErr = fmt.Errorf("Claude API returning empty content")
+			continue
+		}
+
+		rawText := ""
+		for _, cnt := range cResp.Content {
+			if cnt.Type == "text" {
+				rawText += cnt.Text
+			}
+		}
+
+		rawText = strings.TrimSpace(rawText)
+		if idx := strings.Index(rawText, "{"); idx != -1 {
+			if lastIdx := strings.LastIndex(rawText, "}"); lastIdx != -1 && lastIdx > idx {
+				rawText = rawText[idx : lastIdx+1]
+			}
+		}
+
+		var res ReimburseCheckResult
+		if err := json.Unmarshal([]byte(rawText), &res); err != nil {
+			lastErr = fmt.Errorf("Gagal parsing JSON reimburse dari AI (%s): %v", model, err)
+			continue
+		}
+
+		return &res, nil
+	}
+
+	errMsg := fmt.Sprintf("%v", lastErr)
+	if strings.Contains(errMsg, "authentication_error") || strings.Contains(errMsg, "not_found_error") || strings.Contains(errMsg, "invalid") || strings.HasPrefix(apiKey, "sk-ant-usr-") {
+		return nil, fmt.Errorf("API Key Claude tidak memiliki akses API Console. Mohon gunakan API Key resmi dari https://console.anthropic.com")
+	}
+
+	return nil, fmt.Errorf("Gagal memproses Reimburse dengan Claude AI: %v", lastErr)
+}
+
+func parseReimburseWithGemini(pdfBytes []byte, apiKey string) (*ReimburseCheckResult, error) {
+	base64PDF := base64.StdEncoding.EncodeToString(pdfBytes)
+
+	prompt := `Anda adalah AI auditor keuangan dan pemeriksa dokumen klaim reimburse / expense claim.
+Dokumen PDF ini berisi formulir rekapitulasi klaim reimbursement (pada Halaman 1 / halaman awal) dan halaman-halaman berikutnya berisi lampiran kwitansi / struk / nota / bukti transfer fisik yang ditempel.
+
+Tugas Anda:
+1. Baca formulir rekap klaim (halaman awal):
+   - "employee_name": Nama karyawan yang mengajukan klaim
+   - "department": Divisi / Departemen (jika ada, kosongkan "" jika tidak ada)
+   - "recap_date": Tanggal formulir pengajuan
+   - "recap_number": Nomor form / nomor klaim / no reimburse (jika ada)
+   - "recap_total": Total nominal uang yang diajukan pada formulir rekap (angka desimal/float murni tanpa simbol Rp atau titik pemisah, contoh: 350000).
+
+2. Cari dan deteksi SEMUA bukti/kwitansi/struk/nota/tiket fisik yang ada pada halaman lampiran (halaman 2 ke atas, atau struk yang tertempel):
+   Untuk SETIAP kwitansi yang ditemukan, masukkan ke array "receipts":
+   - "receipt_no": nomor urut struk (1, 2, 3...)
+   - "merchant": Nama toko / restoran / merchant / vendor (contoh: "Indomaret", "Pertamina", "Grab", dll)
+   - "date": Tanggal transaksi pada struk (format YYYY-MM-DD atau sesuai tertera)
+   - "amount": Nominal total pembayaran pada kwitansi tersebut (angka float murni, contoh: 45000).
+   - "page_number": Nomor halaman PDF di mana kwitansi ini berada (1, 2, 3, dst)
+   - "description": Jenis pengeluaran / item belanja / keperluan (contoh: "BBM Pertamax", "Konsumsi Rapat", "Parkir")
+   - "is_legible": true jika nominal dan nota terbaca jelas, false jika buram / terpotong
+
+Format output: KEMBALIKAN HANYA SATU JSON OBJECT MURNI:
+{
+  "employee_name": "...",
+  "department": "...",
+  "recap_date": "...",
+  "recap_number": "...",
+  "recap_total": 0,
+  "receipts": [
+    {
+      "receipt_no": 1,
+      "merchant": "...",
+      "date": "...",
+      "amount": 0,
+      "page_number": 2,
+      "description": "...",
+      "is_legible": true
+    }
+  ]
+}`
+
+	reqBody := GeminiReq{
+		Contents: []GeminiContent{
+			{
+				Parts: []GeminiPart{
+					{
+						InlineData: &GeminiInlineData{
+							MimeType: "application/pdf",
+							Data:      base64PDF,
+						},
+					},
+					{
+						Text: prompt,
+					},
+				},
+			},
+		},
+		GenerationConfig: &GeminiGenConfig{
+			ResponseMimeType: "application/json",
+		},
+	}
+
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	models := []string{
+		"gemini-2.5-flash",
+		"gemini-flash-latest",
+		"gemini-3.5-flash",
+		"gemini-3.1-flash-lite",
+		"gemini-flash-lite-latest",
+	}
+	var lastErr error
+	var isQuotaError bool
+
+	for _, model := range models {
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			var gErr GeminiResp
+			_ = json.Unmarshal(respBytes, &gErr)
+			errMsg := string(respBytes)
+			if gErr.Error != nil {
+				errMsg = gErr.Error.Message
+			}
+			if resp.StatusCode == 429 || strings.Contains(strings.ToLower(errMsg), "quota") || strings.Contains(strings.ToLower(errMsg), "exceeded") {
+				isQuotaError = true
+				lastErr = fmt.Errorf("Gemini API Quota tercapai. Silakan coba beberapa saat lagi atau gunakan CLAUDE_API_KEY")
+			} else {
+				lastErr = fmt.Errorf("Gemini API error (%s): %s", model, errMsg)
+			}
+			continue
+		}
+
+		var gResp GeminiResp
+		if err := json.Unmarshal(respBytes, &gResp); err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("Gemini API returning empty response")
+			continue
+		}
+
+		rawText := gResp.Candidates[0].Content.Parts[0].Text
+		rawText = strings.TrimSpace(rawText)
+
+		if strings.HasPrefix(rawText, "```") {
+			lines := strings.Split(rawText, "\n")
+			if len(lines) > 2 {
+				rawText = strings.Join(lines[1:len(lines)-1], "\n")
+			}
+		}
+		rawText = strings.TrimSpace(rawText)
+
+		if idx := strings.Index(rawText, "{"); idx != -1 {
+			if lastIdx := strings.LastIndex(rawText, "}"); lastIdx != -1 && lastIdx > idx {
+				rawText = rawText[idx : lastIdx+1]
+			}
+		}
+
+		var res ReimburseCheckResult
+		if err := json.Unmarshal([]byte(rawText), &res); err != nil {
+			lastErr = fmt.Errorf("Gagal parsing JSON reimburse dari Gemini AI (%s): %v", model, err)
+			continue
+		}
+
+		return &res, nil
+	}
+
+	if isQuotaError {
+		return nil, fmt.Errorf("Gemini API Request Limit/Quota tercapai. Mohon tunggu beberapa saat atau gunakan CLAUDE_API_KEY")
+	}
+
+	return nil, fmt.Errorf("Gagal memproses Reimburse dengan Gemini AI: %v", lastErr)
+}
+
+func parseReimbursePDFWithAI(pdfBytes []byte) (*ReimburseCheckResult, error) {
+	var claudeErr error
+	claudeKey := getClaudeAPIKey()
+	if claudeKey != "" {
+		if strings.HasPrefix(claudeKey, "sk-ant-usr-") {
+			claudeErr = fmt.Errorf("API Key 'sk-ant-usr-' adalah token web Claude.ai. Mohon gunakan API Key resmi dari https://console.anthropic.com")
+		} else {
+			res, err := parseReimburseWithClaude(pdfBytes, claudeKey)
+			if err == nil && res != nil {
+				return res, nil
+			}
+			claudeErr = err
+		}
+	}
+
+	geminiKey := getGeminiAPIKey()
+	if geminiKey != "" {
+		res, err := parseReimburseWithGemini(pdfBytes, geminiKey)
+		if err == nil && res != nil {
+			return res, nil
+		}
+		if claudeErr != nil {
+			return nil, fmt.Errorf("Claude gagal (%v), Gemini juga gagal (%v)", claudeErr, err)
+		}
+		return nil, fmt.Errorf("Gagal memproses Reimburse dengan Gemini AI: %v", err)
+	}
+
+	if claudeErr != nil {
+		return nil, claudeErr
+	}
+
+	return nil, fmt.Errorf("API Key AI belum dikonfigurasi. Silakan atur CLAUDE_API_KEY atau GEMINI_API_KEY")
+}
+
+func formatNominalRupiah(amount float64) string {
+	intVal := int64(math.Round(amount))
+	str := strconv.FormatInt(intVal, 10)
+	n := len(str)
+	if n <= 3 {
+		return str
+	}
+	var res []string
+	remainder := n % 3
+	if remainder > 0 {
+		res = append(res, str[:remainder])
+	}
+	for i := remainder; i < n; i += 3 {
+		res = append(res, str[i:i+3])
+	}
+	return strings.Join(res, ".")
+}
+
+func reconcileReimburse(result *ReimburseCheckResult) {
+	var physicalTotal float64
+	for i := range result.Receipts {
+		if result.Receipts[i].ReceiptNo == 0 {
+			result.Receipts[i].ReceiptNo = i + 1
+		}
+		physicalTotal += result.Receipts[i].Amount
+	}
+	result.PhysicalTotal = physicalTotal
+
+	diff := result.RecapTotal - physicalTotal
+	diff = math.Round(diff*100) / 100
+	result.Difference = diff
+
+	hasIllegible := false
+	for _, rc := range result.Receipts {
+		if !rc.IsLegible {
+			hasIllegible = true
+			break
+		}
+	}
+
+	if math.Abs(diff) < 1.0 {
+		result.Status = "MATCH"
+		result.StatusMessage = "Total kwitansi fisik sesuai 100% dengan total form rekap!"
+	} else if diff > 0 {
+		result.Status = "OVERCLAIM"
+		result.StatusMessage = fmt.Sprintf("Total rekap formulir lebih besar Rp %s dari total kwitansi fisik (kwitansi kurang)", formatNominalRupiah(diff))
+	} else {
+		result.Status = "UNDERCLAIM"
+		result.StatusMessage = fmt.Sprintf("Total kwitansi fisik lebih besar Rp %s dari formulir rekap", formatNominalRupiah(-diff))
+	}
+
+	if hasIllegible {
+		result.StatusMessage += " (Perhatian: ada kwitansi yang kurang jelas/buram)"
+	}
+}
+
+func generateReimburseAuditExcel(res *ReimburseCheckResult) (string, error) {
+	f := excelize.NewFile()
+	sheet := "Audit Reimburse"
+	idx, _ := f.NewSheet(sheet)
+	f.SetActiveSheet(idx)
+	f.DeleteSheet("Sheet1")
+
+	_ = f.SetSheetView(sheet, 0, &excelize.ViewOptions{
+		ShowGridLines: &[]bool{true}[0],
+	})
+
+	titleStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 16, Color: "#DB2777"},
+		Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
+	})
+	subtitleStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Italic: true, Size: 10, Color: "#64748B"},
+		Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
+	})
+	sectionHeaderStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 11, Color: "#1E293B"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#F1F5F9"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
+	})
+	boldLabelStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 10, Color: "#334155"},
+		Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
+	})
+	valueStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Size: 10, Color: "#0F172A"},
+		Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
+	})
+	statusMatchStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 11, Color: "#065F46"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#D1FAE5"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#10B981", Style: 1},
+			{Type: "top", Color: "#10B981", Style: 1},
+			{Type: "right", Color: "#10B981", Style: 1},
+			{Type: "bottom", Color: "#10B981", Style: 1},
+		},
+	})
+	statusMismatchStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 11, Color: "#991B1B"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#FEE2E2"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#EF4444", Style: 1},
+			{Type: "top", Color: "#EF4444", Style: 1},
+			{Type: "right", Color: "#EF4444", Style: 1},
+			{Type: "bottom", Color: "#EF4444", Style: 1},
+		},
+	})
+	tableHeaderStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 10, Color: "#FFFFFF"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#DB2777"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#831843", Style: 1},
+			{Type: "top", Color: "#831843", Style: 1},
+			{Type: "right", Color: "#831843", Style: 1},
+			{Type: "bottom", Color: "#831843", Style: 1},
+		},
+	})
+	currencyFmt := `_-* #,##0_-;-* #,##0_-;_-* "-"_-;_-@_-`
+	evenCurrencyStyle, _ := f.NewStyle(&excelize.Style{
+		CustomNumFmt: &currencyFmt,
+		Fill:         excelize.Fill{Type: "pattern", Color: []string{"#FCE7F3"}, Pattern: 1},
+		Alignment:    &excelize.Alignment{Horizontal: "right", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	oddCurrencyStyle, _ := f.NewStyle(&excelize.Style{
+		CustomNumFmt: &currencyFmt,
+		Alignment:    &excelize.Alignment{Horizontal: "right", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	evenRowStyle, _ := f.NewStyle(&excelize.Style{
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#FCE7F3"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	oddRowStyle, _ := f.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	centerEvenRowStyle, _ := f.NewStyle(&excelize.Style{
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#FCE7F3"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	centerOddRowStyle, _ := f.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "#FBCFE8", Style: 1},
+			{Type: "top", Color: "#FBCFE8", Style: 1},
+			{Type: "right", Color: "#FBCFE8", Style: 1},
+			{Type: "bottom", Color: "#FBCFE8", Style: 1},
+		},
+	})
+	totalRowStyle, _ := f.NewStyle(&excelize.Style{
+		Font:         &excelize.Font{Bold: true, Size: 11, Color: "#FFFFFF"},
+		Fill:         excelize.Fill{Type: "pattern", Color: []string{"#831843"}, Pattern: 1},
+		CustomNumFmt: &currencyFmt,
+		Alignment:    &excelize.Alignment{Horizontal: "right", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "top", Color: "#831843", Style: 2},
+			{Type: "bottom", Color: "#831843", Style: 2},
+		},
+	})
+	totalLabelStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 11, Color: "#FFFFFF"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"#831843"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "top", Color: "#831843", Style: 2},
+			{Type: "bottom", Color: "#831843", Style: 2},
+		},
+	})
+
+	f.SetCellValue(sheet, "B2", "LAPORAN AUDIT REKONSILIASI REIMBURSE")
+	f.SetCellStyle(sheet, "B2", "B2", titleStyle)
+	f.SetCellValue(sheet, "B3", "Asisten Payrol — Hasil Pencocokan Formulir Rekap vs Kwitansi Fisik Lampiran")
+	f.SetCellStyle(sheet, "B3", "B3", subtitleStyle)
+
+	f.SetCellValue(sheet, "B5", "INFORMASI PENGAJUAN")
+	f.MergeCell(sheet, "B5", "D5")
+	f.SetCellStyle(sheet, "B5", "D5", sectionHeaderStyle)
+
+	f.SetCellValue(sheet, "B6", "Nama Karyawan:")
+	f.SetCellStyle(sheet, "B6", "B6", boldLabelStyle)
+	f.SetCellValue(sheet, "C6", res.EmployeeName)
+	f.SetCellStyle(sheet, "C6", "C6", valueStyle)
+
+	f.SetCellValue(sheet, "B7", "Departemen / Divisi:")
+	f.SetCellStyle(sheet, "B7", "B7", boldLabelStyle)
+	f.SetCellValue(sheet, "C7", res.Department)
+	f.SetCellStyle(sheet, "C7", "C7", valueStyle)
+
+	f.SetCellValue(sheet, "B8", "Tanggal Rekap:")
+	f.SetCellStyle(sheet, "B8", "B8", boldLabelStyle)
+	f.SetCellValue(sheet, "C8", res.RecapDate)
+	f.SetCellStyle(sheet, "C8", "C8", valueStyle)
+
+	f.SetCellValue(sheet, "B9", "Nomor Form:")
+	f.SetCellStyle(sheet, "B9", "B9", boldLabelStyle)
+	f.SetCellValue(sheet, "C9", res.RecapNumber)
+	f.SetCellStyle(sheet, "C9", "C9", valueStyle)
+
+	f.SetCellValue(sheet, "E5", "RINGKASAN AUDIT")
+	f.MergeCell(sheet, "E5", "G5")
+	f.SetCellStyle(sheet, "E5", "G5", sectionHeaderStyle)
+
+	f.SetCellValue(sheet, "E6", "Total Rekap Form:")
+	f.SetCellStyle(sheet, "E6", "E6", boldLabelStyle)
+	f.SetCellValue(sheet, "F6", res.RecapTotal)
+	f.SetCellStyle(sheet, "F6", "F6", oddCurrencyStyle)
+
+	f.SetCellValue(sheet, "E7", "Total Kwitansi Fisik:")
+	f.SetCellStyle(sheet, "E7", "E7", boldLabelStyle)
+	f.SetCellValue(sheet, "F7", res.PhysicalTotal)
+	f.SetCellStyle(sheet, "F7", "F7", oddCurrencyStyle)
+
+	f.SetCellValue(sheet, "E8", "Selisih Nominal:")
+	f.SetCellStyle(sheet, "E8", "E8", boldLabelStyle)
+	f.SetCellValue(sheet, "F8", res.Difference)
+	f.SetCellStyle(sheet, "F8", "F8", oddCurrencyStyle)
+
+	f.SetCellValue(sheet, "E9", "Status Hasil Audit:")
+	f.SetCellStyle(sheet, "E9", "E9", boldLabelStyle)
+	if res.Status == "MATCH" {
+		f.SetCellValue(sheet, "F9", "🟢 COCOK (MATCH)")
+		f.SetCellStyle(sheet, "F9", "F9", statusMatchStyle)
+	} else {
+		f.SetCellValue(sheet, "F9", "🔴 SELISIH (MISMATCH)")
+		f.SetCellStyle(sheet, "F9", "F9", statusMismatchStyle)
+	}
+
+	headers := []string{"No", "Merchant / Toko", "Tanggal Struk", "Hal. PDF", "Keperluan / Uraian", "Status Nota", "Nominal (Rp)"}
+	tableStartRow := 11
+	for ci, h := range headers {
+		colLetter, _ := excelize.ColumnNumberToName(ci + 2)
+		cell := fmt.Sprintf("%s%d", colLetter, tableStartRow)
+		f.SetCellValue(sheet, cell, h)
+		f.SetCellStyle(sheet, cell, cell, tableHeaderStyle)
+	}
+
+	curRow := tableStartRow + 1
+	for idx, r := range res.Receipts {
+		isEven := curRow%2 == 0
+		rStyle := oddRowStyle
+		cStyle := centerOddRowStyle
+		currStyle := oddCurrencyStyle
+		if isEven {
+			rStyle = evenRowStyle
+			cStyle = centerEvenRowStyle
+			currStyle = evenCurrencyStyle
+		}
+
+		legibleStr := "Jelas"
+		if !r.IsLegible {
+			legibleStr = "Buram / Kurang Jelas"
+		}
+
+		f.SetCellValue(sheet, fmt.Sprintf("B%d", curRow), idx+1)
+		f.SetCellStyle(sheet, fmt.Sprintf("B%d", curRow), fmt.Sprintf("B%d", curRow), cStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("C%d", curRow), r.Merchant)
+		f.SetCellStyle(sheet, fmt.Sprintf("C%d", curRow), fmt.Sprintf("C%d", curRow), rStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("D%d", curRow), r.Date)
+		f.SetCellStyle(sheet, fmt.Sprintf("D%d", curRow), fmt.Sprintf("D%d", curRow), cStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("E%d", curRow), fmt.Sprintf("Hal %d", r.PageNumber))
+		f.SetCellStyle(sheet, fmt.Sprintf("E%d", curRow), fmt.Sprintf("E%d", curRow), cStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("F%d", curRow), r.Description)
+		f.SetCellStyle(sheet, fmt.Sprintf("F%d", curRow), fmt.Sprintf("F%d", curRow), rStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("G%d", curRow), legibleStr)
+		f.SetCellStyle(sheet, fmt.Sprintf("G%d", curRow), fmt.Sprintf("G%d", curRow), cStyle)
+
+		f.SetCellValue(sheet, fmt.Sprintf("H%d", curRow), r.Amount)
+		f.SetCellStyle(sheet, fmt.Sprintf("H%d", curRow), fmt.Sprintf("H%d", curRow), currStyle)
+
+		curRow++
+	}
+
+	if len(res.Receipts) > 0 {
+		f.SetCellValue(sheet, fmt.Sprintf("B%d", curRow), "TOTAL KWITANSI FISIK")
+		f.MergeCell(sheet, fmt.Sprintf("B%d", curRow), fmt.Sprintf("G%d", curRow))
+		f.SetCellStyle(sheet, fmt.Sprintf("B%d", curRow), fmt.Sprintf("G%d", curRow), totalLabelStyle)
+
+		f.SetCellFormula(sheet, fmt.Sprintf("H%d", curRow), fmt.Sprintf("SUM(H12:H%d)", curRow-1))
+		f.SetCellStyle(sheet, fmt.Sprintf("H%d", curRow), fmt.Sprintf("H%d", curRow), totalRowStyle)
+	}
+
+	f.SetColWidth(sheet, "A", "A", 3)
+	f.SetColWidth(sheet, "B", "B", 8)
+	f.SetColWidth(sheet, "C", "C", 24)
+	f.SetColWidth(sheet, "D", "D", 16)
+	f.SetColWidth(sheet, "E", "E", 12)
+	f.SetColWidth(sheet, "F", "F", 28)
+	f.SetColWidth(sheet, "G", "G", 18)
+	f.SetColWidth(sheet, "H", "H", 20)
+
+	tmpOut, err := os.CreateTemp("", "audit-reimburse-*.xlsx")
+	if err != nil {
+		return "", err
+	}
+	tmpOutPath := tmpOut.Name()
+	tmpOut.Close()
+
+	if err := f.SaveAs(tmpOutPath); err != nil {
+		_ = os.Remove(tmpOutPath)
+		return "", err
+	}
+
+	return tmpOutPath, nil
+}
+
+func handleReimburseCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "POST" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Method not allowed"})
+		return
+	}
+
+	err := r.ParseMultipartForm(50 << 20) // 50MB max
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Gagal membaca form upload: " + err.Error()})
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "File PDF reimburse tidak ditemukan"})
+		return
+	}
+	defer file.Close()
+
+	if !strings.HasSuffix(strings.ToLower(header.Filename), ".pdf") {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Hanya file format PDF yang didukung untuk Checker Reimburse"})
+		return
+	}
+
+	pdfBytes, err := io.ReadAll(file)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Gagal membaca isi file PDF"})
+		return
+	}
+
+	result, err := parseReimbursePDFWithAI(pdfBytes)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	reconcileReimburse(result)
+
+	if tmpPath, err := generateReimburseAuditExcel(result); err == nil {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", tmpPath, time.Now().UnixNano())))
+		downloadId := hex.EncodeToString(h[:16])
+
+		downloadCacheMutex.Lock()
+		downloadCache[downloadId] = DownloadCacheItem{
+			FilePath:  tmpPath,
+			CreatedAt: time.Now(),
+		}
+		downloadCacheMutex.Unlock()
+
+		result.DownloadId = downloadId
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"data":    result,
+	})
+}
+
+func handleReimburseDownload(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "ID download tidak valid", 400)
+		return
+	}
+
+	downloadCacheMutex.RLock()
+	item, ok := downloadCache[id]
+	downloadCacheMutex.RUnlock()
+
+	if !ok || item.FilePath == "" {
+		http.Error(w, "File download telah kedaluwarsa. Silakan upload dan periksa ulang.", 404)
+		return
+	}
+
+	if _, err := os.Stat(item.FilePath); os.IsNotExist(err) {
+		http.Error(w, "File download tidak ditemukan di server", 404)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", "attachment; filename=laporan_audit_reimburse.xlsx")
+	http.ServeFile(w, r, item.FilePath)
+}
+
 const loginHTML = `<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -2633,6 +3459,9 @@ input[type=file]{display:none}
       <button class="nav-btn active" id="tabMerge" onclick="switchTab('merge')">
         <span>📊</span> Merge Data Lembur
       </button>
+      <button class="nav-btn" id="tabReimburse" onclick="switchTab('reimburse')">
+        <span>🧾</span> Checker Reimburse
+      </button>
       <button class="nav-btn" id="tabUsers" onclick="switchTab('users')">
         <span>👥</span> Master User
       </button>
@@ -2736,7 +3565,148 @@ input[type=file]{display:none}
     </div>
   </div>
 
-  <!-- MENU 2: MASTER USER -->
+  <!-- MENU 2: CHECKER REIMBURSE -->
+  <div id="menuReimburse" style="display:none">
+    <div class="card">
+      <div style="margin-bottom:20px">
+        <h2 style="font-size:20px;font-weight:700;color:var(--text-primary);display:flex;align-items:center;gap:10px">
+          <span>🧾</span> Checker &amp; Rekonsiliasi Reimburse
+        </h2>
+        <p style="font-size:13px;color:var(--text-secondary);margin-top:4px">
+          Periksa kecocokan antara total form rekapitulasi (halaman 1) dengan bukti kwitansi / nota fisik yang dilampirkan menggunakan AI Vision
+        </p>
+      </div>
+
+      <div class="drop-zone" id="reimburseDropZone">
+        <div class="drop-icon">📑</div>
+        <div class="drop-title">Drag &amp; drop file PDF Reimburse di sini</div>
+        <div class="drop-subtitle">atau klik untuk memilih file PDF klaim reimburse (form rekap + lampiran kwitansi)</div>
+        <button type="button" class="drop-btn" id="reimburseBrowseBtn">
+          <span>📎</span> Pilih Dokumen PDF Reimburse
+        </button>
+        <input type="file" id="reimburseFileInput" accept=".pdf">
+      </div>
+
+      <div class="file-list" id="reimburseFileList"></div>
+
+      <div class="spinner" id="reimburseSpinner">
+        <div class="spinner-ring"></div>
+        <div class="spinner-text" id="reimburseSpinnerText">Menganalisis formulir rekap &amp; mendeteksi seluruh kwitansi fisik dengan AI Vision...</div>
+      </div>
+    </div>
+
+    <!-- Audit Result Card -->
+    <div id="reimburseResultCard" style="display:none">
+      <!-- Status Banner -->
+      <div id="auditStatusBanner" style="
+        border-radius:var(--radius);
+        padding:22px 28px;
+        margin-bottom:24px;
+        display:flex;
+        align-items:center;
+        gap:20px;
+        transition:all .3s;
+      ">
+        <div id="auditStatusIcon" style="font-size:38px;flex-shrink:0"></div>
+        <div style="flex:1">
+          <div id="auditStatusTitle" style="font-size:18px;font-weight:800;letter-spacing:-.3px"></div>
+          <div id="auditStatusDesc" style="font-size:13.5px;margin-top:4px;opacity:.95"></div>
+        </div>
+      </div>
+
+      <!-- Info Chips Header -->
+      <div style="
+        background:rgba(26,32,53,.7);
+        border:1px solid var(--border);
+        border-radius:var(--radius-sm);
+        padding:14px 20px;
+        margin-bottom:20px;
+        display:flex;
+        flex-wrap:wrap;
+        gap:20px;
+        font-size:13px;
+        color:var(--text-secondary);
+      ">
+        <div>👤 Karyawan: <strong id="reimburseEmpName" style="color:#fff">-</strong></div>
+        <div>🏢 Divisi: <strong id="reimburseDept" style="color:#fff">-</strong></div>
+        <div>📅 Tanggal Form: <strong id="reimburseDate" style="color:#fff">-</strong></div>
+        <div>📑 No. Rekap: <strong id="reimburseNo" style="color:#fff">-</strong></div>
+      </div>
+
+      <!-- 4 Stat Metrics -->
+      <div class="stats-bar visible" style="margin-bottom:24px">
+        <div class="stat-chip" style="background:rgba(236,72,153,.08);border-color:rgba(236,72,153,.3)">
+          <span class="stat-chip-icon">📋</span>
+          <div>
+            <div class="stat-chip-label" style="font-size:11px">Total Rekap Form</div>
+            <div class="stat-chip-value" id="statRecapTotal" style="font-size:16px;color:#f472b6">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-chip" style="background:rgba(99,102,241,.08);border-color:rgba(99,102,241,.3)">
+          <span class="stat-chip-icon">🧾</span>
+          <div>
+            <div class="stat-chip-label" style="font-size:11px">Total Kwitansi Fisik</div>
+            <div class="stat-chip-value" id="statPhysicalTotal" style="font-size:16px;color:#818cf8">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-chip" id="statDiffChip" style="background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.3)">
+          <span class="stat-chip-icon" id="statDiffIcon">⚖️</span>
+          <div>
+            <div class="stat-chip-label" style="font-size:11px">Selisih Nominal</div>
+            <div class="stat-chip-value" id="statDifference" style="font-size:16px;color:#34d399">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-chip">
+          <span class="stat-chip-icon">📑</span>
+          <div>
+            <div class="stat-chip-label" style="font-size:11px">Jumlah Kwitansi</div>
+            <div class="stat-chip-value" id="statReceiptCount" style="font-size:16px;color:#f1f5f9">0 Nota</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Receipts Table -->
+      <div class="card" style="padding:24px;margin-bottom:24px">
+        <div style="display:flex;align-items:center;justify-space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+          <h3 style="font-size:16px;font-weight:700;color:var(--text-primary);display:flex;align-items:center;gap:8px">
+            <span>🔎</span> Rincian Kwitansi Fisik Terdeteksi
+          </h3>
+          <span style="font-size:12px;color:var(--text-muted)">Diurutkan berdasarkan nomor urut &amp; halaman lampiran</span>
+        </div>
+
+        <div class="table-wrapper visible" style="max-height:450px">
+          <table class="preview-table">
+            <thead>
+              <tr>
+                <th style="width:50px">No</th>
+                <th>Merchant / Toko</th>
+                <th>Tanggal Nota</th>
+                <th>Halaman PDF</th>
+                <th>Keperluan / Uraian</th>
+                <th>Keterbacaan</th>
+                <th style="text-align:right">Nominal (Rp)</th>
+              </tr>
+            </thead>
+            <tbody id="reimburseTableBody">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="actions visible">
+        <button class="btn btn-primary" id="reimburseDownloadBtn">
+          <span>📥</span> Download Laporan Audit Excel (.xlsx)
+        </button>
+        <button class="btn btn-secondary" id="reimburseResetBtn">
+          <span>🔄</span> Periksa Dokumen Lain
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MENU 3: MASTER USER -->
   <div id="menuUsers" style="display:none">
     <div class="card">
       <div style="display:flex;align-items:center;justify-space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px">
@@ -2808,6 +3778,10 @@ input[type=file]{display:none}
             <span>📊 <strong>Merge Data Lembur</strong></span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="addCheckReimburse" value="reimburse" checked style="width:16px;height:16px;accent-color:var(--accent)">
+            <span>🧾 <strong>Checker Reimburse</strong></span>
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-primary);cursor:pointer">
             <input type="checkbox" id="addCheckUsers" value="users" style="width:16px;height:16px;accent-color:var(--accent)">
             <span>👥 <strong>Master User</strong></span>
           </label>
@@ -2863,6 +3837,10 @@ input[type=file]{display:none}
             <span>📊 <strong>Merge Data Lembur</strong> (Upload &amp; Gabung Excel/PDF)</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--text-primary);cursor:pointer">
+            <input type="checkbox" id="permCheckReimburse" value="reimburse" style="width:18px;height:18px;accent-color:var(--accent)">
+            <span>🧾 <strong>Checker Reimburse</strong> (Audit Rekap vs Kwitansi Fisik)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--text-primary);cursor:pointer">
             <input type="checkbox" id="permCheckUsers" value="users" style="width:18px;height:18px;accent-color:var(--accent)">
             <span>👥 <strong>Master User</strong> (Kelola Akun User &amp; Hak Akses)</span>
           </label>
@@ -2916,19 +3894,256 @@ let currentDownloadId = '';
 
 function switchTab(tab) {
   activeTab = tab;
-  if (tab === 'merge') {
-    $('tabMerge').className = 'nav-btn active';
-    $('tabUsers').className = 'nav-btn';
-    $('menuMerge').style.display = 'block';
-    $('menuUsers').style.display = 'none';
-  } else {
-    $('tabMerge').className = 'nav-btn';
-    $('tabUsers').className = 'nav-btn active';
-    $('menuMerge').style.display = 'none';
-    $('menuUsers').style.display = 'block';
+  $('tabMerge').className = tab === 'merge' ? 'nav-btn active' : 'nav-btn';
+  $('tabReimburse').className = tab === 'reimburse' ? 'nav-btn active' : 'nav-btn';
+  $('tabUsers').className = tab === 'users' ? 'nav-btn active' : 'nav-btn';
+  $('menuMerge').style.display = tab === 'merge' ? 'block' : 'none';
+  $('menuReimburse').style.display = tab === 'reimburse' ? 'block' : 'none';
+  $('menuUsers').style.display = tab === 'users' ? 'block' : 'none';
+
+  if (tab === 'users') {
     loadUserTable();
   }
 }
+
+// Reimburse Client Logic
+let selectedReimburseFile = null;
+let currentReimburseDownloadId = '';
+
+const reimburseDropZone = $('reimburseDropZone');
+const reimburseFileInput = $('reimburseFileInput');
+const reimburseBrowseBtn = $('reimburseBrowseBtn');
+const reimburseFileList = $('reimburseFileList');
+const reimburseSpinner = $('reimburseSpinner');
+const reimburseResultCard = $('reimburseResultCard');
+const reimburseDownloadBtn = $('reimburseDownloadBtn');
+const reimburseResetBtn = $('reimburseResetBtn');
+
+['dragenter','dragover'].forEach(ev => {
+  reimburseDropZone.addEventListener(ev, e => { e.preventDefault(); reimburseDropZone.classList.add('drag-over'); });
+});
+['dragleave','drop'].forEach(ev => {
+  reimburseDropZone.addEventListener(ev, e => { e.preventDefault(); reimburseDropZone.classList.remove('drag-over'); });
+});
+reimburseDropZone.addEventListener('drop', e => {
+  const files = Array.from(e.dataTransfer.files).filter(f => f.name.match(/\.pdf$/i));
+  if (files.length > 0) setReimburseFile(files[0]);
+  else showToast('❌', 'Hanya file format PDF yang didukung untuk Checker Reimburse', 'error');
+});
+
+reimburseBrowseBtn.addEventListener('click', e => { e.stopPropagation(); reimburseFileInput.click(); });
+reimburseDropZone.addEventListener('click', e => {
+  if (e.target === reimburseBrowseBtn || reimburseBrowseBtn.contains(e.target)) return;
+  reimburseFileInput.click();
+});
+reimburseFileInput.addEventListener('change', () => {
+  if (reimburseFileInput.files.length > 0) {
+    setReimburseFile(reimburseFileInput.files[0]);
+  }
+});
+
+function formatNominal(num) {
+  const rounded = Math.round(num);
+  return 'Rp ' + rounded.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+}
+
+function setReimburseFile(file) {
+  selectedReimburseFile = file;
+  renderReimburseFileList();
+  checkReimburseFile();
+}
+
+function renderReimburseFileList() {
+  reimburseFileList.innerHTML = '';
+  if (!selectedReimburseFile) {
+    reimburseFileList.classList.remove('visible');
+    reimburseDropZone.classList.remove('has-file');
+    return;
+  }
+  reimburseDropZone.classList.add('has-file');
+  const item = document.createElement('div');
+  item.className = 'file-item';
+  item.innerHTML = '<span class="file-item-icon">📑</span>' +
+    '<div class="file-item-details">' +
+      '<div class="file-item-name">' + escapeHtml(selectedReimburseFile.name) + ' <span style="font-size:10px;background:#ec4899;color:#fff;padding:1px 6px;border-radius:6px;margin-left:4px">PDF Reimburse</span></div>' +
+      '<div class="file-item-size">' + formatBytes(selectedReimburseFile.size) + '</div>' +
+    '</div>';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'file-item-remove';
+  removeBtn.title = 'Hapus file';
+  removeBtn.textContent = '✕';
+  removeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    resetReimburse();
+  });
+  item.appendChild(removeBtn);
+  reimburseFileList.appendChild(item);
+  reimburseFileList.classList.add('visible');
+}
+
+async function checkReimburseFile() {
+  if (!selectedReimburseFile) return;
+
+  reimburseSpinner.classList.add('visible');
+  reimburseResultCard.style.display = 'none';
+
+  const form = new FormData();
+  form.append('file', selectedReimburseFile);
+
+  try {
+    const resp = await fetch('/api/reimburse/check', { method: 'POST', body: form });
+    if (resp.status === 401) { window.location.href = '/login'; return; }
+    if (resp.status === 403) {
+      showToast('⚠️', 'Anda tidak memiliki hak akses ke modul Checker Reimburse', 'error');
+      reimburseSpinner.classList.remove('visible');
+      return;
+    }
+    const res = await resp.json();
+    reimburseSpinner.classList.remove('visible');
+
+    if (!res.success || !res.data) {
+      showToast('❌', res.error || 'Gagal memeriksa dokumen reimburse', 'error');
+      return;
+    }
+
+    const data = res.data;
+    currentReimburseDownloadId = data.download_id || '';
+
+    // Render employee info
+    $('reimburseEmpName').textContent = data.employee_name || 'Tidak Tertera';
+    $('reimburseDept').textContent = data.department || '-';
+    $('reimburseDate').textContent = data.recap_date || '-';
+    $('reimburseNo').textContent = data.recap_number || '-';
+
+    // Render stat chips
+    $('statRecapTotal').textContent = formatNominal(data.recap_total || 0);
+    $('statPhysicalTotal').textContent = formatNominal(data.physical_total || 0);
+    $('statReceiptCount').textContent = (data.receipts ? data.receipts.length : 0) + ' Nota';
+
+    const diff = data.difference || 0;
+    const absDiff = Math.abs(diff);
+    const statDiffChip = $('statDiffChip');
+    const statDifference = $('statDifference');
+
+    // Status Banner styling
+    const banner = $('auditStatusBanner');
+    const icon = $('auditStatusIcon');
+    const title = $('auditStatusTitle');
+    const desc = $('auditStatusDesc');
+
+    if (data.status === 'MATCH') {
+      banner.style.background = 'rgba(16,185,129,.12)';
+      banner.style.border = '1px solid rgba(16,185,129,.4)';
+      banner.style.boxShadow = '0 8px 30px rgba(16,185,129,.2)';
+      icon.textContent = '🟢';
+      title.style.color = '#34d399';
+      title.textContent = 'HASIL AUDIT: SESUAI / COCOK (MATCH)';
+      desc.style.color = '#a7f3d0';
+      desc.textContent = data.status_message || 'Total formulir rekap sama persis dengan akumulasi nominal seluruh kwitansi fisik yang dilampirkan.';
+      
+      statDiffChip.style.borderColor = 'rgba(16,185,129,.3)';
+      statDifference.style.color = '#34d399';
+      statDifference.textContent = 'Rp 0 (Sesuai)';
+    } else if (data.status === 'OVERCLAIM') {
+      banner.style.background = 'rgba(239,68,68,.14)';
+      banner.style.border = '1px solid rgba(239,68,68,.4)';
+      banner.style.boxShadow = '0 8px 30px rgba(239,68,68,.2)';
+      icon.textContent = '🔴';
+      title.style.color = '#f87171';
+      title.textContent = 'HASIL AUDIT: TERDAPAT SELISIH LEBIH KLAIM (MISMATCH)';
+      desc.style.color = '#fecaca';
+      desc.textContent = data.status_message || 'Nominal rekap form lebih tinggi daripada bukti fisik kwitansi yang ditemukan.';
+
+      statDiffChip.style.borderColor = 'rgba(239,68,68,.4)';
+      statDifference.style.color = '#f87171';
+      statDifference.textContent = '+' + formatNominal(absDiff) + ' (Kwitansi Kurang)';
+    } else { // UNDERCLAIM
+      banner.style.background = 'rgba(245,158,11,.14)';
+      banner.style.border = '1px solid rgba(245,158,11,.4)';
+      banner.style.boxShadow = '0 8px 30px rgba(245,158,11,.2)';
+      icon.textContent = '🟡';
+      title.style.color = '#fbbf24';
+      title.textContent = 'HASIL AUDIT: KWITANSI MELEBIHI REKAP (MISMATCH)';
+      desc.style.color = '#fef3c7';
+      desc.textContent = data.status_message || 'Nominal bukti fisik kwitansi melebihi nilai yang diajukan di form.';
+
+      statDiffChip.style.borderColor = 'rgba(245,158,11,.4)';
+      statDifference.style.color = '#fbbf24';
+      statDifference.textContent = '-' + formatNominal(absDiff);
+    }
+
+    // Receipts table
+    const tbody = $('reimburseTableBody');
+    tbody.innerHTML = '';
+    if (data.receipts && data.receipts.length > 0) {
+      data.receipts.forEach((r, idx) => {
+        const tr = document.createElement('tr');
+        const legibleBadge = r.is_legible 
+          ? '<span style="background:rgba(16,185,129,.15);color:#34d399;font-size:11px;padding:2px 8px;border-radius:6px">Jelas</span>'
+          : '<span style="background:rgba(239,68,68,.15);color:#f87171;font-size:11px;padding:2px 8px;border-radius:6px">Buram/Ragu</span>';
+
+        tr.innerHTML = 
+          '<td><strong>' + (idx + 1) + '</strong></td>' +
+          '<td><strong style="color:var(--text-primary)">' + escapeHtml(r.merchant || '-') + '</strong></td>' +
+          '<td>' + escapeHtml(r.date || '-') + '</td>' +
+          '<td>Hal ' + (r.page_number || '-') + '</td>' +
+          '<td>' + escapeHtml(r.description || '-') + '</td>' +
+          '<td>' + legibleBadge + '</td>' +
+          '<td style="text-align:right;font-weight:700;color:var(--text-primary)">' + formatNominal(r.amount || 0) + '</td>';
+        tbody.appendChild(tr);
+      });
+    } else {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--text-muted)">Tidak ada kwitansi yang terdeteksi pada halaman lampiran</td></tr>';
+    }
+
+    reimburseResultCard.style.display = 'block';
+    showToast(data.status === 'MATCH' ? '🎉' : '⚠️', 'Audit reimburse selesai! ' + (data.status === 'MATCH' ? 'Semua nominal cocok.' : 'Ditemukan selisih nominal.'), data.status === 'MATCH' ? 'success' : 'error');
+  } catch (err) {
+    reimburseSpinner.classList.remove('visible');
+    showToast('❌', 'Terjadi kesalahan: ' + err.message, 'error');
+  }
+}
+
+reimburseDownloadBtn.addEventListener('click', async () => {
+  if (!currentReimburseDownloadId) {
+    showToast('⚠️', 'ID download tidak tersedia. Silakan periksa ulang dokumen.', 'error');
+    return;
+  }
+  reimburseDownloadBtn.disabled = true;
+  reimburseDownloadBtn.innerHTML = '<span class="spinner-ring" style="width:16px;height:16px;border-width:2px;display:inline-block"></span> Mengunduh...';
+
+  try {
+    const resp = await fetch('/api/reimburse/download?id=' + encodeURIComponent(currentReimburseDownloadId));
+    if (!resp.ok) throw new Error('Gagal mengunduh (' + resp.status + ')');
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'laporan_audit_reimburse.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('🎉', 'Laporan audit Excel berhasil diunduh!', 'success');
+  } catch (err) {
+    showToast('❌', err.message, 'error');
+  } finally {
+    reimburseDownloadBtn.disabled = false;
+    reimburseDownloadBtn.innerHTML = '<span>📥</span> Download Laporan Audit Excel (.xlsx)';
+  }
+});
+
+function resetReimburse() {
+  selectedReimburseFile = null;
+  currentReimburseDownloadId = '';
+  reimburseFileInput.value = '';
+  reimburseFileList.innerHTML = '';
+  reimburseFileList.classList.remove('visible');
+  reimburseDropZone.classList.remove('has-file');
+  reimburseResultCard.style.display = 'none';
+  reimburseSpinner.classList.remove('visible');
+}
+
+reimburseResetBtn.addEventListener('click', resetReimburse);
 
 // Drag & drop
 ['dragenter','dragover'].forEach(ev => {
@@ -3222,6 +4437,9 @@ async function loadUserTable() {
       if (perms.includes('merge')) {
         permChips += '<span style="background:rgba(236,72,153,.15);color:#f472b6;font-size:11px;padding:2px 8px;border-radius:8px;margin-right:4px">📊 Merge</span>';
       }
+      if (perms.includes('reimburse')) {
+        permChips += '<span style="background:rgba(244,63,94,.15);color:#fb7185;font-size:11px;padding:2px 8px;border-radius:8px;margin-right:4px">🧾 Reimburse</span>';
+      }
       if (perms.includes('users')) {
         permChips += '<span style="background:rgba(99,102,241,.15);color:#818cf8;font-size:11px;padding:2px 8px;border-radius:8px">👥 Master User</span>';
       }
@@ -3251,6 +4469,7 @@ function openAddUserModal() {
   $('addUsername').value = '';
   $('addPassword').value = '';
   $('addCheckMerge').checked = true;
+  $('addCheckReimburse').checked = true;
   $('addCheckUsers').checked = false;
   $('modalAddUser').style.display = 'block';
   $('modalEditPw').style.display = 'none';
@@ -3277,6 +4496,7 @@ function openPermsModal(username, perms) {
   $('permUsernameDisplay').value = username;
   const pList = Array.isArray(perms) ? perms : [];
   $('permCheckMerge').checked = pList.includes('merge');
+  $('permCheckReimburse').checked = pList.includes('reimburse');
   $('permCheckUsers').checked = pList.includes('users');
 
   $('modalAddUser').style.display = 'none';
@@ -3316,6 +4536,7 @@ async function submitAddUser(e) {
 
   const permissions = [];
   if ($('addCheckMerge').checked) permissions.push('merge');
+  if ($('addCheckReimburse').checked) permissions.push('reimburse');
   if ($('addCheckUsers').checked) permissions.push('users');
 
   if (permissions.length === 0) {
@@ -3384,6 +4605,7 @@ async function submitUpdatePerms(e) {
   const username = $('permUsername').value;
   const permissions = [];
   if ($('permCheckMerge').checked) permissions.push('merge');
+  if ($('permCheckReimburse').checked) permissions.push('reimburse');
   if ($('permCheckUsers').checked) permissions.push('users');
 
   if (permissions.length === 0) {
@@ -3448,15 +4670,24 @@ fetch('/api/users')
   .then(data => {
     if (data && data.currentUser) {
       $('currentUsername').textContent = data.currentUser;
-      const perms = data.currentUserPerms || ['merge', 'users'];
+      const perms = data.currentUserPerms || ['merge', 'reimburse', 'users'];
       if (!perms.includes('users')) {
         $('tabUsers').style.display = 'none';
       } else {
         $('tabUsers').style.display = 'inline-flex';
       }
+      if (!perms.includes('reimburse')) {
+        $('tabReimburse').style.display = 'none';
+      } else {
+        $('tabReimburse').style.display = 'inline-flex';
+      }
       if (!perms.includes('merge')) {
         $('tabMerge').style.display = 'none';
-        switchTab('users');
+        if (perms.includes('reimburse')) {
+          switchTab('reimburse');
+        } else {
+          switchTab('users');
+        }
       } else {
         $('tabMerge').style.display = 'inline-flex';
       }
